@@ -1,0 +1,42 @@
+services:
+
+    api:
+        build: .
+
+        container_name: chatbot_api
+
+        ports:
+            - "8000:8000"
+
+        volumes:
+            - .:/app
+            - ./logs:/app/logs
+
+        env_file:
+            - .env
+
+        environment:
+            - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/chatbot
+            - ALEMBIC_DATABASE_URL=postgresql+psycopg://postgres:postgres@postgres:5432/chatbot
+
+        depends_on:
+            - postgres
+
+    postgres:
+        image: pgvector/pgvector:pg17
+
+        container_name: chatbot_db
+
+        environment:
+            POSTGRES_USER: postgres
+            POSTGRES_PASSWORD: postgres
+            POSTGRES_DB: chatbot
+
+        ports:
+            - "5433:5432"
+
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+
+volumes:
+    postgres_data:
