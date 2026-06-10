@@ -3,6 +3,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.exceptions import NotFoundException
 from app.core.logging.loggers import application_logger, error_logger
 from app.modules.documents.models.document_model import Document
 from app.modules.documents.repositories.document_chunk_repository import (
@@ -10,6 +11,9 @@ from app.modules.documents.repositories.document_chunk_repository import (
 )
 from app.modules.documents.repositories.document_repository import (
     DocumentRepository
+)
+from app.modules.knowledge_bases.repositories.knowledge_base_repository import (
+    KnowledgeBaseRepository
 )
 from app.modules.documents.services.document_extractor_service import (
     DocumentExtractorService
@@ -42,6 +46,7 @@ class ProcessDocumentUseCase:
         db: AsyncSession
     ):
         self.document_repository = DocumentRepository(db)
+        self.kb_repository = KnowledgeBaseRepository(db)
         self.chunk_repository = DocumentChunkRepository(db)
         self.embedding_repository = ChunkEmbeddingRepository(db)
 
@@ -83,6 +88,9 @@ class ProcessDocumentUseCase:
         file_size: int,
         file_bytes: bytes | None = None
     ) -> Document:
+
+        if not await self.kb_repository.get_by_id(knowledge_base_id):
+            raise NotFoundException("Base de conocimiento", str(knowledge_base_id))
 
         file_url: str | None = None
         if file_bytes is not None:

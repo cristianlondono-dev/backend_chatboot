@@ -52,8 +52,8 @@ class Agent(Base):
         nullable=False
     )
 
-    knowledge_bases: Mapped[list] = relationship(
+    knowledge_bases: Mapped[list["AgentKnowledgeBase"]] = relationship(  # noqa: F821
         "AgentKnowledgeBase",
         back_populates="agent",
-        lazy="selectin"
+        lazy="raise"
     )

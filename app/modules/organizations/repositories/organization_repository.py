@@ -1,3 +1,5 @@
+from uuid import UUID
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +43,9 @@ class OrganizationRepository:
 
         return organization
     
+    async def get_by_id(self, organization_id: UUID) -> Organization | None:
+        return await self.db.get(Organization, organization_id)
+
     async def get_by_tax_id(
         self,
         tax_id: str
