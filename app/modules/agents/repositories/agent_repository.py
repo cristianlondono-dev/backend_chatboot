@@ -2,6 +2,7 @@ from uuid import UUID
 
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.modules.agents.models.agent_model import Agent
 from app.modules.agents.models.agent_knowledge_base_model import AgentKnowledgeBase
@@ -27,15 +28,22 @@ class AgentRepository:
         )
         self.db.add(agent)
         await self.db.commit()
-        await self.db.refresh(agent)
-        return agent
+        # Reload with relationship so serialization doesn't fail
+        return await self._load(agent.id)
 
     async def get_by_id(self, agent_id: UUID) -> Agent | None:
-        return await self.db.get(Agent, agent_id)
+        result = await self.db.execute(
+            select(Agent)
+            .where(Agent.id == agent_id)
+            .options(selectinload(Agent.knowledge_bases))
+        )
+        return result.scalar_one_or_none()
 
     async def get_by_organization_id(self, organization_id: UUID) -> list[Agent]:
         result = await self.db.execute(
-            select(Agent).where(Agent.organization_id == organization_id)
+            select(Agent)
+            .where(Agent.organization_id == organization_id)
+            .options(selectinload(Agent.knowledge_bases))
         )
         return list(result.scalars().all())
 
@@ -73,3 +81,12 @@ class AgentRepository:
             )
         )
         return list(result.scalars().all())
+
+    async def _load(self, agent_id: UUID) -> Agent:
+        result = await self.db.execute(
+            select(Agent)
+            .where(Agent.id == agent_id)
+            .options(selectinload(Agent.knowledge_bases))
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one()
