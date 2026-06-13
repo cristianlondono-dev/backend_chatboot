@@ -68,6 +68,7 @@ async def ask_organization(
     organization_id: UUID,
     body: AskRequest,
     area: str | None = Query(default=None, description="Filtrar por área/departamento"),
+    top_k: int = Query(default=5, ge=1, le=20, description="Número de chunks a recuperar"),
     db: AsyncSession = Depends(get_db)
 ):
     kb_repo = KnowledgeBaseRepository(db)
@@ -82,7 +83,7 @@ async def ask_organization(
 
     kb_ids = [kb.id for kb in kbs]
     use_case = AskMultiKbUseCase(db)
-    answer = await use_case.execute(knowledge_base_ids=kb_ids, question=body.question)
+    answer = await use_case.execute(knowledge_base_ids=kb_ids, question=body.question, top_k=top_k)
 
     return AskResponse(question=body.question, answer=answer)
 
@@ -92,6 +93,7 @@ async def ask_organization_stream(
     organization_id: UUID,
     body: AskRequest,
     area: str | None = Query(default=None, description="Filtrar por área/departamento"),
+    top_k: int = Query(default=5, ge=1, le=20, description="Número de chunks a recuperar"),
     db: AsyncSession = Depends(get_db)
 ):
     kb_repo = KnowledgeBaseRepository(db)
@@ -108,7 +110,7 @@ async def ask_organization_stream(
     use_case = AskMultiKbUseCase(db)
 
     async def event_stream():
-        async for chunk in use_case.execute_stream(kb_ids, body.question):
+        async for chunk in use_case.execute_stream(kb_ids, body.question, top_k=top_k):
             yield f"data: {json.dumps(chunk)}\n\n"
         yield "data: [DONE]\n\n"
 
