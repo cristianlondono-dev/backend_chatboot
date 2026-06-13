@@ -11,6 +11,7 @@ from app.modules.health.controllers.health_controller import router as health_ro
 from app.modules.organizations.controllers.organization_controller import router as organization_router
 from app.modules.knowledge_bases.controllers.knowledge_base_controller import router as knowledge_base_router
 from app.modules.agents.controllers.agent_controller import router as agent_router
+from app.modules.memory.controllers.memory_controller import router as memory_router
 
 setup_logging()
 
@@ -94,6 +95,7 @@ app.include_router(health_router)
 app.include_router(organization_router)
 app.include_router(knowledge_base_router)
 app.include_router(agent_router)
+app.include_router(memory_router)
 
 
 @app.get("/")
