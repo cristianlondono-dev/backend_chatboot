@@ -7,6 +7,7 @@ from fastapi import APIRouter
 from fastapi import Depends
 from fastapi import File
 from fastapi import HTTPException
+from fastapi import Query
 from fastapi import UploadFile
 from fastapi import status
 from fastapi.responses import StreamingResponse
@@ -134,31 +135,31 @@ async def upload_document(
 async def ask_knowledge_base(
     knowledge_base_id: UUID,
     body: AskRequest,
+    top_k: int = Query(default=5, ge=1, le=20, description="Número de chunks a recuperar"),
     db: AsyncSession = Depends(get_db)
 ):
     use_case = AskKnowledgeBaseUseCase(db)
 
     answer = await use_case.execute(
         knowledge_base_id=knowledge_base_id,
-        question=body.question
+        question=body.question,
+        top_k=top_k
     )
 
-    return AskResponse(
-        question=body.question,
-        answer=answer
-    )
+    return AskResponse(question=body.question, answer=answer)
 
 
 @router.post("/{knowledge_base_id}/ask/stream")
 async def ask_knowledge_base_stream(
     knowledge_base_id: UUID,
     body: AskRequest,
+    top_k: int = Query(default=5, ge=1, le=20, description="Número de chunks a recuperar"),
     db: AsyncSession = Depends(get_db)
 ):
     use_case = AskKnowledgeBaseUseCase(db)
 
     async def event_stream():
-        async for chunk in use_case.execute_stream(knowledge_base_id, body.question):
+        async for chunk in use_case.execute_stream(knowledge_base_id, body.question, top_k=top_k):
             yield f"data: {json.dumps(chunk)}\n\n"
         yield "data: [DONE]\n\n"
 

@@ -1,7 +1,7 @@
 import json
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -80,6 +80,7 @@ async def remove_knowledge_base(
 async def ask_agent(
     agent_id: UUID,
     body: AskAgentRequest,
+    top_k: int = Query(default=5, ge=1, le=20, description="Número de chunks a recuperar"),
     db: AsyncSession = Depends(get_db)
 ):
     repo = AgentRepository(db)
@@ -94,7 +95,7 @@ async def ask_agent(
         )
 
     use_case = AskMultiKbUseCase(db)
-    answer = await use_case.execute(knowledge_base_ids=kb_ids, question=body.question)
+    answer = await use_case.execute(knowledge_base_ids=kb_ids, question=body.question, top_k=top_k)
 
     return AskAgentResponse(question=body.question, answer=answer)
 
@@ -103,6 +104,7 @@ async def ask_agent(
 async def ask_agent_stream(
     agent_id: UUID,
     body: AskAgentRequest,
+    top_k: int = Query(default=5, ge=1, le=20, description="Número de chunks a recuperar"),
     db: AsyncSession = Depends(get_db)
 ):
     repo = AgentRepository(db)
@@ -119,7 +121,7 @@ async def ask_agent_stream(
     use_case = AskMultiKbUseCase(db)
 
     async def event_stream():
-        async for chunk in use_case.execute_stream(kb_ids, body.question):
+        async for chunk in use_case.execute_stream(kb_ids, body.question, top_k=top_k):
             yield f"data: {json.dumps(chunk)}\n\n"
         yield "data: [DONE]\n\n"
 
