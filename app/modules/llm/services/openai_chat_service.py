@@ -31,6 +31,21 @@ class OpenAIChatService:
         self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
         self.async_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
+    def generate_response_with_messages(self, messages: list[dict]) -> str:
+        try:
+            response = self.client.chat.completions.create(model=_MODEL, messages=messages)
+        except Exception as exc:
+            error_logger.error(f"OpenAI chat error: {type(exc).__name__}: {exc}", exc_info=True)
+            raise
+
+        usage = response.usage
+        cost = _chat_cost(_MODEL, usage.prompt_tokens, usage.completion_tokens)
+        openai_logger.info(
+            f"[chat-memory] model={_MODEL} | input={usage.prompt_tokens} | output={usage.completion_tokens} "
+            f"| total={usage.total_tokens} | cost=${cost:.6f}"
+        )
+        return response.choices[0].message.content
+
     def generate_response(self, prompt: str) -> str:
         try:
             response = self.client.chat.completions.create(
