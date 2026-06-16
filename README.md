@@ -1,7 +1,7 @@
 # Enterprise Chatbot API
 
 Backend RAG (Retrieval-Augmented Generation) construido con **FastAPI + PostgreSQL + pgvector + OpenAI**.  
-Permite a empresas subir documentos y consultarlos mediante lenguaje natural.
+Permite a empresas subir documentos y consultarlos mediante lenguaje natural, con memoria conversacional por usuario y soporte multi-canal.
 
 ---
 
@@ -10,17 +10,23 @@ Permite a empresas subir documentos y consultarlos mediante lenguaje natural.
 1. [Arquitectura conceptual](#arquitectura-conceptual)
 2. [Jerarquía de datos](#jerarquía-de-datos)
 3. [Cómo funciona el RAG](#cómo-funciona-el-rag)
-4. [Los tres niveles de consulta](#los-tres-niveles-de-consulta)
-5. [Referencia de endpoints](#referencia-de-endpoints)
+4. [Sistema de memoria](#sistema-de-memoria)
+5. [Módulo de Tools (canales e identidad)](#módulo-de-tools-canales-e-identidad)
+6. [Flujos: interno vs externo](#flujos-interno-vs-externo)
+7. [Los niveles de consulta](#los-niveles-de-consulta)
+8. [Referencia de endpoints](#referencia-de-endpoints)
    - [Health](#health)
    - [Organizations](#organizations)
    - [Knowledge Bases](#knowledge-bases)
    - [Agents](#agents)
-6. [Flujo completo de ejemplo](#flujo-completo-de-ejemplo)
-7. [Formatos de archivo soportados](#formatos-de-archivo-soportados)
-8. [Variables de entorno](#variables-de-entorno)
-9. [Logs](#logs)
-10. [Docker](#docker)
+   - [Chat con memoria](#chat-con-memoria)
+   - [Tools](#tools)
+9. [Flujo completo de ejemplo](#flujo-completo-de-ejemplo)
+10. [Configurar Google Sheets como fuente de empleados](#configurar-google-sheets-como-fuente-de-empleados)
+11. [Formatos de archivo soportados](#formatos-de-archivo-soportados)
+12. [Variables de entorno](#variables-de-entorno)
+13. [Logs](#logs)
+14. [Docker](#docker)
 
 ---
 
@@ -29,28 +35,23 @@ Permite a empresas subir documentos y consultarlos mediante lenguaje natural.
 ```
 Organization (empresa)
 │
-├── Knowledge Base "RRHH"            ← documentos de recursos humanos
+├── Knowledge Base "RRHH"
 │   ├── contrato_laboral.pdf
 │   └── politica_vacaciones.docx
 │
-├── Knowledge Base "Ventas"          ← documentos de ventas
+├── Knowledge Base "Ventas"
 │   ├── catalogo_productos.pdf
 │   └── lista_precios.xlsx
 │
-├── Knowledge Base "Tesorería"
-│   └── presupuesto_2026.xlsx
+├── Agent "Bot Interno RRHH"
+│   ├── → Knowledge Base "RRHH"
+│   ├── Tool (canal: whatsapp, usuarios: internos, resolver: google_sheets)
+│   └── Memoria por usuario (sesiones, memories, summaries)
 │
-├── Agent "Bot Interno RRHH"         ← solo consulta KB de RRHH
-│   └── → Knowledge Base "RRHH"
-│
-├── Agent "Bot Comercial Externo"    ← consulta Ventas + Atención al Cliente
-│   ├── → Knowledge Base "Ventas"
-│   └── → Knowledge Base "Atención al Cliente"
-│
-└── Agent "Bot General"              ← consulta TODAS las KBs de la empresa
-    ├── → Knowledge Base "RRHH"
+└── Agent "Bot Comercial Externo"
     ├── → Knowledge Base "Ventas"
-    └── → Knowledge Base "Tesorería"
+    ├── Tool (canal: whatsapp, usuarios: externos, onboarding: [nombre, empresa])
+    └── Memoria por usuario
 ```
 
 ---
@@ -59,39 +60,216 @@ Organization (empresa)
 
 ```
 Organization
-  └── Knowledge Base (N)           una org puede tener N bases de conocimiento
-        └── Document (N)           una KB puede tener N documentos
-              └── DocumentChunk    cada doc se divide en fragmentos de ~1000 chars
-                    └── Embedding  cada chunk tiene un vector (1536 dims) para búsqueda semántica
+  └── Knowledge Base (N)
+        └── Document (N)
+              └── DocumentChunk         (~1000 chars cada uno)
+                    └── ChunkEmbedding  vector 1536 dims (text-embedding-3-small)
 
 Agent
-  └── AgentKnowledgeBase (N)       un agente puede apuntar a N bases de conocimiento
+  └── AgentKnowledgeBase (N)            KBs vinculadas al agente
+  └── AgentTool (N)                     configuración por canal
+
+User (cross-canal)
+  ├── canonical_id                      ID estable (employee_id o teléfono)
+  ├── UserChannel (N)                   mapeo canal → usuario (whatsapp, teams, etc.)
+  └── Por agente:
+        ├── ChatSession                 sesión activa (auto-cierra a 30 min)
+        │     └── Message (N)           historial completo
+        ├── UserMemory (N)              hechos extraídos por el LLM
+        └── ConversationSummary (N)     resúmenes auto-generados (cada 100 msgs)
 ```
 
 ---
 
 ## Cómo funciona el RAG
 
-Cuando se hace una pregunta:
+Cuando se hace una pregunta al agente:
 
-1. **Embedding de la pregunta** — la pregunta se convierte en un vector con `text-embedding-3-small`
-2. **Búsqueda semántica** — se buscan los chunks más similares mediante distancia coseno en pgvector
-3. **Construcción del contexto** — los top-N chunks se concatenan como contexto
-4. **Generación de respuesta** — se llama a `gpt-4.1-mini` con el contexto + la pregunta
-5. **Respuesta** — si no hay información relevante, responde `"No encontré información suficiente para responder."`
+1. **Embedding de la pregunta** — se convierte en un vector con `text-embedding-3-small`
+2. **Búsqueda semántica** — se calculan similitudes coseno contra los chunks en pgvector  
+   `similarity = 1 - cosine_distance` | filtro mínimo: `similarity ≥ 0.30`
+3. **Top-K configurable** — se recuperan los N chunks más relevantes (1–20, default 5)
+4. **Contexto enriquecido** — cada chunk incluye fuente y relevancia:
+   ```
+   [Fuente: contrato_laboral.pdf | Relevancia: 87%]
+   Los empleados tienen derecho a 15 días hábiles de vacaciones...
+   ```
+5. **Generación de respuesta** — `gpt-4.1-mini` recibe el contexto + pregunta + memoria del usuario
+6. **Sin información relevante** — responde `"No encontré información suficiente para responder."`
 
 ---
 
-## Los tres niveles de consulta
+## Sistema de memoria
+
+Cada conversación se asocia a un usuario identificado por canal. La memoria persiste entre sesiones.
+
+### Componentes
+
+| Componente | Descripción |
+|------------|-------------|
+| **ChatSession** | Sesión activa por agente+usuario. Se cierra automáticamente tras 30 min de inactividad. |
+| **Message** | Cada turno (user/assistant) guardado con timestamp y token count. |
+| **UserMemory** | Hechos extraídos del usuario por el LLM (`"Trabaja en Bogotá"`, `"Le interesa el producto X"`). Importancia: `low / medium / high`. |
+| **ConversationSummary** | Resumen automático generado cada 100 mensajes para comprimir el historial. |
+
+### Construcción del contexto
+
+Antes de cada respuesta, el sistema construye el prompt completo con:
+
+```
+[PERFIL DEL USUARIO]
+Nombre: Juan Pérez
+Cargo: Analista de Nómina
+
+[LO QUE SÉ DE ESTE USUARIO]
+- Prefiere respuestas detalladas (high)
+- Pregunta frecuentemente sobre vacaciones (medium)
+
+[RESÚMENES DE CONVERSACIONES ANTERIORES]
+En sesiones previas habló sobre ...
+
+[INFORMACIÓN DE LA EMPRESA]
+[Fuente: politica_vacaciones.pdf | Relevancia: 91%]
+Los empleados con más de un año ...
+```
+
+### Identificación cross-canal
+
+Un mismo empleado puede escribir desde WhatsApp y desde Teams y el sistema lo reconoce como la misma persona:
+
+```
+users
+  id: uuid
+  canonical_id: "EMP-001"    ← estable entre canales
+  user_type: "internal"
+
+user_channels
+  channel: "whatsapp"    channel_id: "+57300..."    → user_id
+  channel: "teams"       channel_id: "juan@..."     → user_id (mismo)
+```
+
+---
+
+## Módulo de Tools (canales e identidad)
+
+Un **Tool** define cómo el agente interactúa con usuarios en un canal específico: cómo identificarlos, si son internos o externos, cómo resolver su identidad y qué preguntas de onboarding hacer.
+
+### Modelo AgentTool
+
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `channel` | string | Canal: `whatsapp`, `teams`, `webchat`, `slack` |
+| `identifier_type` | string | Cómo llega el ID: `phone`, `email`, `employee_id` |
+| `user_type` | string | `internal` o `external` |
+| `resolver_type` | string | `none`, `rest_api`, `google_sheets` |
+| `resolver_config` | JSON | Configuración del resolver (URL, credenciales, etc.) |
+| `field_mapping` | JSON | Qué campos del resolver convertir en memorias del usuario |
+| `onboarding_questions` | JSON | Preguntas para usuarios externos (ver formato abajo) |
+
+### Resolvers disponibles
+
+#### `rest_api`
+Consulta un endpoint HTTP para verificar si el usuario existe.
+
+```json
+{
+  "url": "https://api.empresa.com/employees/{identifier}",
+  "method": "GET",
+  "headers": { "Authorization": "Bearer TOKEN" },
+  "response_path": "data.employee",
+  "canonical_field": "employee_id"
+}
+```
+
+#### `google_sheets`
+Busca el usuario en una hoja de cálculo de Google.
+
+```json
+{
+  "spreadsheet_id": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms",
+  "sheet_name": "Empleados",
+  "identifier_column": "celular",
+  "canonical_field": "cedula",
+  "credentials_json": { "type": "service_account", "...": "..." }
+}
+```
+
+### Field mapping
+
+Convierte columnas del resolver en memorias automáticas del usuario:
+
+```json
+{
+  "NOMBRE": "Nombre: {value}",
+  "CARGO":  "Cargo: {value}",
+  "JEFE":   "Jefe inmediato: {value}"
+}
+```
+
+### Onboarding (usuarios externos)
+
+Preguntas que el agente hace al nuevo usuario. El campo extra (además de `"question"`) define la etiqueta con la que se guarda la respuesta en memoria:
+
+```json
+[
+  { "question": "¿Cuál es tu nombre?",                      "memory_key": "nombre" },
+  { "question": "¿En qué empresa trabajas?",                "memory_key": "empresa" },
+  { "question": "¿Qué producto o servicio te interesa?",    "memory_key": "interes" }
+]
+```
+
+El agente humaniza las preguntas con el LLM — nunca las hace de forma robótica.
+
+---
+
+## Flujos: interno vs externo
+
+### Usuario interno (empleado)
+
+```
+Usuario escribe → agente recibe channel + channel_id
+                         ↓
+              Busca Tool del agente para ese canal
+                         ↓
+              Llama al resolver (REST API / Google Sheets)
+                         ↓
+        ¿Existe en la fuente de datos?
+        NO → "No estás registrado en el sistema"  (acceso denegado)
+        SÍ → canonical_id = employee_id del resolver
+             memorias = campos mapeados (nombre, cargo, jefe...)
+                         ↓
+              Crea/reutiliza usuario en BD
+              Crea/reutiliza sesión de chat
+                         ↓
+              Chat normal con RAG + memoria
+```
+
+### Usuario externo (cliente)
+
+```
+Usuario escribe → agente recibe channel + channel_id (teléfono)
+                         ↓
+              Busca Tool del agente para ese canal
+                         ↓
+              canonical_id = channel_id (el teléfono ES el identificador)
+                         ↓
+        ¿Tiene onboarding pendiente?
+        SÍ → Hace preguntas humanizadas con el LLM
+             Guarda respuestas como memorias de alta importancia
+        NO → Chat normal con RAG + memoria
+```
+
+---
+
+## Los niveles de consulta
 
 | Nivel | Endpoint | Busca en... | Cuándo usarlo |
 |-------|----------|-------------|---------------|
-| **KB específica** | `POST /knowledge-bases/{kb_id}/ask` | Un solo documento/grupo de docs en esa KB | Bot especializado en un tema exacto |
-| **Por área** | `POST /organizations/{org_id}/ask?area=ventas` | Todas las KBs de esa área | Consultar todo lo de un departamento |
-| **Toda la org** | `POST /organizations/{org_id}/ask` | Todas las KBs de la empresa | Bot general sin filtro |
-| **Agente** | `POST /agents/{agent_id}/ask` | Las KBs que el agente tiene vinculadas | Bot personalizado con control total |
-
-**El agente es el nivel más flexible:** puedes vincularle exactamente las KBs que necesite, sin importar el área.
+| **KB específica** | `POST /knowledge-bases/{kb_id}/ask` | Una sola KB | Bot especializado en un tema exacto |
+| **Por área** | `POST /organizations/{org_id}/ask?area=ventas` | KBs de esa área | Consultar un departamento completo |
+| **Toda la org** | `POST /organizations/{org_id}/ask` | Todas las KBs | Bot general sin filtro |
+| **Agente (RAG puro)** | `POST /agents/{agent_id}/ask` | KBs vinculadas | Consulta sin memoria de usuario |
+| **Agente (con memoria)** | `POST /agents/{agent_id}/chat` | KBs + historial + memories | Chatbot conversacional completo |
 
 ---
 
@@ -100,9 +278,7 @@ Cuando se hace una pregunta:
 ### Health
 
 #### `GET /health`
-Verifica conectividad con la base de datos.
 
-**Respuesta**
 ```json
 { "database": true }
 ```
@@ -112,7 +288,6 @@ Verifica conectividad con la base de datos.
 ### Organizations
 
 #### `POST /organizations`
-Crea una empresa/organización.
 
 **Body**
 ```json
@@ -132,12 +307,6 @@ Crea una empresa/organización.
 {
   "id": "uuid",
   "trade_name": "Empresa XYZ",
-  "business_name": "Empresa XYZ S.A.S.",
-  "tax_id": "900123456-7",
-  "contact_phone": "+57 300 0000000",
-  "address": "Calle 100 # 15-20",
-  "department": "Cundinamarca",
-  "city": "Bogotá",
   "created_at": "2026-06-09T14:00:00Z"
 }
 ```
@@ -145,81 +314,35 @@ Crea una empresa/organización.
 ---
 
 #### `GET /organizations/{organization_id}/agents`
-Lista todos los agentes (bots) de una organización.
-
-**Respuesta `200`**
-```json
-[
-  {
-    "id": "agent-uuid",
-    "organization_id": "org-uuid",
-    "name": "Bot Comercial Externo",
-    "description": "Atiende consultas de clientes externos",
-    "visibility": "external",
-    "created_at": "2026-06-09T14:00:00Z",
-    "knowledge_bases": [
-      { "knowledge_base_id": "kb-uuid-ventas", "added_at": "2026-06-09T14:05:00Z" },
-      { "knowledge_base_id": "kb-uuid-atencion", "added_at": "2026-06-09T14:06:00Z" }
-    ]
-  }
-]
-```
+Lista todos los agentes de una organización.
 
 ---
 
 #### `POST /organizations/{organization_id}/ask`
-Consulta **todas** las bases de conocimiento de la organización.  
-Opcionalmente filtra por área con el query param `?area=`.
+Consulta todas las bases de conocimiento de la organización.
 
-**Query params opcionales**
-| Param | Descripción | Ejemplo |
-|-------|-------------|---------|
-| `area` | Filtra solo las KBs de esa área | `?area=ventas` |
+**Query params**
+
+| Param | Descripción |
+|-------|-------------|
+| `area` | Filtra por área: `?area=ventas` |
+| `top_k` | Chunks a recuperar (1–20, default 5) |
 
 **Body**
 ```json
 { "question": "¿Cuántos días de vacaciones tiene un empleado nuevo?" }
 ```
 
-**Respuesta `200`**
-```json
-{
-  "question": "¿Cuántos días de vacaciones tiene un empleado nuevo?",
-  "answer": "Según la política de la empresa, un empleado nuevo..."
-}
-```
-
-**Ejemplos de uso:**
-```
-POST /organizations/org-uuid/ask                    → busca en TODAS las KBs
-POST /organizations/org-uuid/ask?area=rrhh          → busca solo en KBs de RRHH
-POST /organizations/org-uuid/ask?area=ventas        → busca solo en KBs de ventas
-```
-
 ---
 
 #### `POST /organizations/{organization_id}/ask/stream`
-Igual que el anterior pero la respuesta llega en tiempo real como **Server-Sent Events**.
-
-**Respuesta** `text/event-stream`
-```
-data: "Según"
-data: " la"
-data: " política..."
-data: [DONE]
-```
-
-Acepta el mismo query param `?area=`.
+Igual que el anterior con streaming SSE.
 
 ---
 
 ### Knowledge Bases
 
-Una Knowledge Base (KB) es un contenedor lógico de documentos relacionados.  
-Una empresa puede tener tantas KBs como necesite.
-
 #### `POST /knowledge-bases`
-Crea una base de conocimiento.
 
 **Body**
 ```json
@@ -231,75 +354,33 @@ Crea una base de conocimiento.
 }
 ```
 
-> El campo `area` es libre — puede ser cualquier texto: `"rrhh"`, `"ventas"`, `"tesoreria"`, `"legal"`, etc.  
-> Se usa para filtrar con `?area=` en el endpoint de la organización.
-
-**Respuesta `201`**
-```json
-{
-  "id": "kb-uuid",
-  "organization_id": "org-uuid",
-  "name": "Políticas de RRHH",
-  "description": "Contratos, vacaciones, reglamento interno",
-  "area": "rrhh",
-  "created_at": "2026-06-09T14:00:00Z"
-}
-```
+> El campo `area` es libre: `"rrhh"`, `"ventas"`, `"tesoreria"`, etc. Se usa para filtrar con `?area=` en el endpoint de la organización.
 
 ---
 
 #### `POST /knowledge-bases/{knowledge_base_id}/documents`
-Sube un documento a la KB. El sistema lo procesa automáticamente:  
-extrae texto → limpia → divide en chunks → genera embeddings → almacena.
+Sube un documento. El sistema extrae texto → limpia → divide en chunks → genera embeddings.
 
-**Form-data**
-| Campo | Tipo | Descripción |
-|-------|------|-------------|
-| `file` | archivo | PDF, DOCX, CSV, JSON o XLSX |
+**Form-data:** campo `file` (PDF, DOCX, CSV, JSON o XLSX)
 
-**Formatos soportados:** `.pdf` `.docx` `.csv` `.json` `.xlsx`
+**Estados del documento**
 
-**Respuesta `201`**
-```json
-{
-  "id": "doc-uuid",
-  "knowledge_base_id": "kb-uuid",
-  "file_name": "contrato_laboral.pdf",
-  "file_type": "pdf",
-  "file_size": 204800,
-  "status": "PROCESSED",
-  "chunks_total": 24,
-  "chunks_processed": 24,
-  "created_at": "2026-06-09T14:01:00Z"
-}
-```
-
-**Estados posibles del documento**
 | Estado | Descripción |
 |--------|-------------|
-| `PENDING` | Recibido, pendiente de procesar |
-| `PROCESSING` | Extrayendo texto y generando embeddings |
+| `PENDING` | Recibido, pendiente |
+| `PROCESSING` | Generando embeddings |
 | `PROCESSED` | Listo para consultas |
 | `FAILED` | Error durante el procesamiento |
-
-> Si `SUPABASE_URL` está configurado, el archivo original se sube al bucket de Supabase y se guarda la URL en `file_url`.
 
 ---
 
 #### `POST /knowledge-bases/{knowledge_base_id}/ask`
-Consulta **solo** esta base de conocimiento.
+
+**Query params:** `top_k` (1–20, default 5)
 
 **Body**
 ```json
 { "question": "¿Cuál es el proceso para solicitar vacaciones?" }
-```
-
-**Respuesta `200`**
-```json
-{
-  "question": "¿Cuál es el proceso para solicitar vacaciones?",
-  "answer": "Según el reglamento interno, el empleado debe..."
-}
 ```
 
 ---
@@ -311,17 +392,7 @@ Igual que el anterior con streaming SSE.
 
 ### Agents
 
-Un **agente** es un bot configurado con exactamente las bases de conocimiento que necesita.  
-Es el nivel de personalización más alto.
-
-**Un agente puede tener de 1 a N knowledge bases vinculadas.**  
-Cada llamada a `POST /agents/{agent_id}/knowledge-bases` agrega una KB.  
-No hay límite máximo.
-
----
-
 #### `POST /agents`
-Crea un agente.
 
 **Body**
 ```json
@@ -334,13 +405,12 @@ Crea un agente.
 ```
 
 **Campo `visibility`**
+
 | Valor | Descripción |
 |-------|-------------|
-| `"internal"` | Solo para uso interno (empleados) |
+| `"internal"` | Solo para empleados |
 | `"external"` | Para clientes externos |
 | `"both"` | Ambos públicos |
-
-> `visibility` es metadata — hoy te ayuda a organizar. En el futuro se puede usar para control de acceso con autenticación.
 
 **Respuesta `201`**
 ```json
@@ -348,7 +418,6 @@ Crea un agente.
   "id": "agent-uuid",
   "organization_id": "org-uuid",
   "name": "Bot Comercial Externo",
-  "description": "Responde preguntas de clientes sobre productos y precios",
   "visibility": "external",
   "created_at": "2026-06-09T14:00:00Z",
   "knowledge_bases": []
@@ -360,27 +429,10 @@ Crea un agente.
 #### `GET /agents/{agent_id}`
 Obtiene el agente con todas sus KBs vinculadas.
 
-**Respuesta `200`**
-```json
-{
-  "id": "agent-uuid",
-  "organization_id": "org-uuid",
-  "name": "Bot Comercial Externo",
-  "description": "Responde preguntas de clientes sobre productos y precios",
-  "visibility": "external",
-  "created_at": "2026-06-09T14:00:00Z",
-  "knowledge_bases": [
-    { "knowledge_base_id": "kb-uuid-ventas",   "added_at": "2026-06-09T14:05:00Z" },
-    { "knowledge_base_id": "kb-uuid-productos", "added_at": "2026-06-09T14:06:00Z" }
-  ]
-}
-```
-
 ---
 
 #### `POST /agents/{agent_id}/knowledge-bases`
-Vincula **una** base de conocimiento al agente.  
-Llama este endpoint tantas veces como KBs quieras agregar.
+Vincula una KB al agente. Para vincular varias, llama el endpoint N veces.
 
 **Body**
 ```json
@@ -389,24 +441,17 @@ Llama este endpoint tantas veces como KBs quieras agregar.
 
 **Respuesta `204 No Content`**
 
-**Para vincular 3 KBs a un agente, haces 3 llamadas:**
-```
-POST /agents/agent-uuid/knowledge-bases  → { "knowledge_base_id": "kb-ventas" }
-POST /agents/agent-uuid/knowledge-bases  → { "knowledge_base_id": "kb-productos" }
-POST /agents/agent-uuid/knowledge-bases  → { "knowledge_base_id": "kb-garantias" }
-```
-
 ---
 
 #### `DELETE /agents/{agent_id}/knowledge-bases/{knowledge_base_id}`
-Desvincula una base de conocimiento del agente.
-
-**Respuesta `204 No Content`**
+Desvincula una KB del agente. **Respuesta `204 No Content`**
 
 ---
 
 #### `POST /agents/{agent_id}/ask`
-Consulta el agente. Busca en **todas** las KBs que tiene vinculadas simultáneamente.
+Consulta el agente sin memoria (RAG puro).
+
+**Query params:** `top_k` (1–20, default 5)
 
 **Body**
 ```json
@@ -417,8 +462,7 @@ Consulta el agente. Busca en **todas** las KBs que tiene vinculadas simultáneam
 ```json
 {
   "question": "¿El producto X tiene garantía de 2 años?",
-  "answer": "Sí, según el catálogo de productos...",
-  "sources": []
+  "answer": "Sí, según el catálogo de productos..."
 }
 ```
 
@@ -429,9 +473,150 @@ Igual que el anterior con streaming SSE.
 
 ---
 
+### Chat con memoria
+
+#### `POST /agents/{agent_id}/chat`
+Chatbot conversacional completo: identidad, onboarding, RAG, memoria de usuario, historial.
+
+**Query params:** `top_k` (1–20, default 5)
+
+**Body**
+```json
+{
+  "channel": "whatsapp",
+  "channel_id": "+573001234567",
+  "question": "¿Cuántos días de vacaciones me quedan?"
+}
+```
+
+**Valores de `channel`:** `whatsapp`, `teams`, `webchat`, `slack`
+
+**Respuesta `200`**
+```json
+{
+  "answer": "Hola Juan! Según la política de la empresa, como llevas más de un año...",
+  "session_id": "session-uuid",
+  "user_id": "user-uuid"
+}
+```
+
+**Respuesta si usuario interno no está en el resolver:**
+```json
+{
+  "answer": "No estás registrado en el sistema. Por favor contacta a tu administrador.",
+  "session_id": null,
+  "user_id": null
+}
+```
+
+---
+
+#### `GET /agents/{agent_id}/users/{channel}/{channel_id}/history`
+Historial de mensajes del usuario en ese canal.
+
+**Query params:** `limit` (1–200, default 50)
+
+**Respuesta `200`**
+```json
+[
+  { "role": "user",      "content": "¿Cuántos días de vacaciones tengo?", "created_at": "..." },
+  { "role": "assistant", "content": "Según el reglamento...",              "created_at": "..." }
+]
+```
+
+---
+
+#### `GET /agents/{agent_id}/users/{channel}/{channel_id}/memories`
+Memorias de alta importancia extraídas del usuario.
+
+**Respuesta `200`**
+```json
+[
+  { "memory": "Nombre: Juan Pérez",        "importance": "high" },
+  { "memory": "Cargo: Analista de Nómina", "importance": "high" }
+]
+```
+
+---
+
+### Tools
+
+#### `POST /agents/{agent_id}/tools`
+Crea un tool de canal para el agente.
+
+**Body — usuarios internos con Google Sheets**
+```json
+{
+  "channel": "whatsapp",
+  "identifier_type": "phone",
+  "user_type": "internal",
+  "resolver_type": "google_sheets",
+  "resolver_config": {
+    "spreadsheet_id": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms",
+    "sheet_name": "Empleados",
+    "identifier_column": "celular",
+    "canonical_field": "cedula",
+    "credentials_json": { "type": "service_account", "...": "..." }
+  },
+  "field_mapping": {
+    "NOMBRE": "Nombre: {value}",
+    "CARGO":  "Cargo: {value}",
+    "JEFE":   "Jefe inmediato: {value}"
+  },
+  "onboarding_questions": []
+}
+```
+
+**Body — usuarios externos con onboarding**
+```json
+{
+  "channel": "whatsapp",
+  "identifier_type": "phone",
+  "user_type": "external",
+  "resolver_type": "none",
+  "resolver_config": null,
+  "field_mapping": null,
+  "onboarding_questions": [
+    { "question": "¿Cuál es tu nombre?",                   "memory_key": "nombre" },
+    { "question": "¿En qué empresa trabajas?",             "memory_key": "empresa" },
+    { "question": "¿Qué producto o servicio te interesa?", "memory_key": "interes" }
+  ]
+}
+```
+
+**Respuesta `201`**
+```json
+{
+  "id": "tool-uuid",
+  "agent_id": "agent-uuid",
+  "channel": "whatsapp",
+  "identifier_type": "phone",
+  "user_type": "external",
+  "resolver_type": "none",
+  "is_active": true
+}
+```
+
+---
+
+#### `GET /agents/{agent_id}/tools`
+Lista todos los tools del agente.
+
+---
+
+#### `GET /agents/{agent_id}/tools/{tool_id}`
+Obtiene un tool específico.
+
+---
+
+#### `DELETE /agents/{agent_id}/tools/{tool_id}`
+Desactiva un tool. **Respuesta `204 No Content`**
+
+---
+
 ## Flujo completo de ejemplo
 
-### Caso: Empresa con bot interno de RRHH y bot externo de ventas
+### Caso: Bot interno de RRHH con Google Sheets + Bot externo de ventas
 
 ```
 # 1. Crear la empresa
@@ -447,15 +632,9 @@ POST /knowledge-bases
   { "organization_id": "org-abc", "name": "Catálogo de Ventas", "area": "ventas" }
   → kb_id = "kb-ventas"
 
-POST /knowledge-bases
-  { "organization_id": "org-abc", "name": "Manual de Garantías", "area": "ventas" }
-  → kb_id = "kb-garantias"
-
 # 3. Subir documentos
-POST /knowledge-bases/kb-rrhh/documents        → contrato_laboral.pdf
-POST /knowledge-bases/kb-rrhh/documents        → politica_vacaciones.docx
-POST /knowledge-bases/kb-ventas/documents      → catalogo_2026.pdf
-POST /knowledge-bases/kb-garantias/documents   → manual_garantias.pdf
+POST /knowledge-bases/kb-rrhh/documents     → contrato_laboral.pdf
+POST /knowledge-bases/kb-ventas/documents   → catalogo_2026.pdf
 
 # 4. Crear agentes
 POST /agents
@@ -466,60 +645,69 @@ POST /agents
   { "organization_id": "org-abc", "name": "Bot Ventas Externo", "visibility": "external" }
   → agent_id = "agent-ventas"
 
-# 5. Vincular KBs a cada agente
+# 5. Vincular KBs
 POST /agents/agent-rrhh/knowledge-bases    → { "knowledge_base_id": "kb-rrhh" }
-
 POST /agents/agent-ventas/knowledge-bases  → { "knowledge_base_id": "kb-ventas" }
-POST /agents/agent-ventas/knowledge-bases  → { "knowledge_base_id": "kb-garantias" }
 
-# 6. Consultar
-# Bot de RRHH — solo sabe de contratos y vacaciones
-POST /agents/agent-rrhh/ask
-  { "question": "¿Cuántos días de vacaciones tengo?" }
+# 6. Configurar Tools
+POST /agents/agent-rrhh/tools
+  → channel: whatsapp, user_type: internal, resolver_type: google_sheets
+  → field_mapping: { "NOMBRE": "Nombre: {value}", "CARGO": "Cargo: {value}" }
 
-# Bot de Ventas — sabe de catálogo Y garantías al mismo tiempo
-POST /agents/agent-ventas/ask
-  { "question": "¿El televisor Samsung tiene garantía de 2 años?" }
+POST /agents/agent-ventas/tools
+  → channel: whatsapp, user_type: external, resolver_type: none
+  → onboarding_questions: [nombre, empresa, interés]
 
-# Consulta por área — sin agente, directo por org
-POST /organizations/org-abc/ask?area=ventas
-  { "question": "¿Qué productos nuevos hay en 2026?" }
+# 7. Chatear
+POST /agents/agent-rrhh/chat
+  { "channel": "whatsapp", "channel_id": "+573001234567", "question": "¿Cuántos días de vacaciones tengo?" }
 
-# Consulta global — busca en TODO
-POST /organizations/org-abc/ask
-  { "question": "¿Qué beneficios tienen los empleados de ventas?" }
+POST /agents/agent-ventas/chat
+  { "channel": "whatsapp", "channel_id": "+573009876543", "question": "Hola" }
+  # ← si es nuevo usuario, arranca el onboarding primero
 ```
 
 ---
 
-## Cuándo usar cada endpoint de consulta
+## Configurar Google Sheets como fuente de empleados
 
+### 1. Preparar la hoja de cálculo
+
+La hoja debe tener encabezados que coincidan con los campos que usarás en `identifier_column`, `canonical_field` y `field_mapping`:
+
+| cedula | celular | NOMBRE | CARGO | JEFE |
+|--------|---------|--------|-------|------|
+| 123456 | +57300... | Juan Pérez | Analista | Pedro Gómez |
+
+### 2. Crear credenciales de Service Account
+
+1. Ir a [Google Cloud Console](https://console.cloud.google.com) → IAM & Admin → Service Accounts
+2. Crear una cuenta de servicio y descargar el archivo JSON de credenciales
+3. Habilitar la API de **Google Sheets** en el proyecto
+4. Compartir la hoja de cálculo con el email de la service account (rol: Lector)
+
+### 3. Obtener el Spreadsheet ID
+
+El ID está en la URL de la hoja:
 ```
-Tengo una KB específica y quiero consultarla sola
-→ POST /knowledge-bases/{kb_id}/ask
-
-Quiero consultar todas las KBs de un departamento
-→ POST /organizations/{org_id}/ask?area=rrhh
-
-Quiero un bot con control total (exactamente estas KBs, no más)
-→ Crear un Agent → vincular KBs → POST /agents/{agent_id}/ask
-
-Quiero un bot que sepa TODO lo de la empresa
-→ POST /organizations/{org_id}/ask  (sin filtro de área)
-   o crear un Agent y vincularle todas las KBs
+https://docs.google.com/spreadsheets/d/SPREADSHEET_ID/edit
 ```
+
+### 4. Crear el tool en el agente
+
+Pasa el contenido completo del JSON de credenciales en `credentials_json` dentro del `resolver_config`.
 
 ---
 
 ## Formatos de archivo soportados
 
-| Formato | Extensión | MIME type |
-|---------|-----------|-----------|
-| PDF | `.pdf` | `application/pdf` |
-| Word | `.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` |
-| Excel | `.xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` |
-| CSV | `.csv` | `text/csv` |
-| JSON | `.json` | `application/json` |
+| Formato | Extensión |
+|---------|-----------|
+| PDF | `.pdf` |
+| Word | `.docx` |
+| Excel | `.xlsx` |
+| CSV | `.csv` |
+| JSON | `.json` |
 
 ---
 
@@ -530,13 +718,11 @@ Quiero un bot que sepa TODO lo de la empresa
 | `DATABASE_URL` | ✅ | URL async para FastAPI (`postgresql+asyncpg://...`) |
 | `ALEMBIC_DATABASE_URL` | ✅ | URL sync para Alembic (`postgresql+psycopg://...`) |
 | `OPENAI_API_KEY` | ✅ | API key de OpenAI |
-| `SUPABASE_URL` | ⬜ | URL del proyecto Supabase (si está vacío, los archivos no se suben) |
+| `SUPABASE_URL` | ⬜ | URL del proyecto Supabase (si está vacío, los archivos no se suben al bucket) |
 | `SUPABASE_SERVICE_KEY` | ⬜ | Service Role Key de Supabase |
 | `SUPABASE_BUCKET_NAME` | ⬜ | Nombre del bucket (default: `documents`) |
 | `APP_NAME` | ⬜ | Nombre de la app (default: `Enterprise Chatbot`) |
 | `ENVIRONMENT` | ⬜ | `development` / `production` (default: `development`) |
-
-> **Supabase es opcional.** Si `SUPABASE_URL` está vacío, los documentos se procesan normalmente pero el archivo original no se guarda en el bucket.
 
 ---
 
@@ -546,33 +732,44 @@ Los logs se escriben en `./logs/` y se rotan automáticamente cada medianoche (3
 
 | Archivo | Contenido |
 |---------|-----------|
-| `application.log` | Eventos de negocio: org creada, KB creada, documento subido/procesado |
-| `rag.log` | Cada consulta: pregunta, KBs buscadas, chunks encontrados, tiempo de búsqueda |
-| `openai.log` | Cada llamada a OpenAI: modelo, tokens usados, costo estimado en USD |
-| `errors.log` | Errores con traceback completo: fallas de procesamiento, errores de API |
+| `application.log` | Eventos de negocio: org creada, KB creada, documento procesado, resolver hits/misses |
+| `rag.log` | Cada consulta RAG: pregunta, KBs buscadas, chunks encontrados con similitud y fuente, tiempo |
+| `openai.log` | Cada llamada a OpenAI: modelo, tokens usados, costo estimado en USD (RAG, chat-memory y onboarding) |
+| `errors.log` | Errores con traceback completo |
+
+**Tags relevantes en los logs:**
+
+| Tag | Descripción |
+|-----|-------------|
+| `[rag]` | Consultas RAG directas (ask endpoints) |
+| `[chat-memory]` | Llamadas al modelo en el flujo de chat con memoria |
+| `[resolver:sheets]` | Búsquedas en Google Sheets |
+| `[resolver]` | Llamadas al resolver REST API |
 
 ---
 
 ## Docker
 
 ```bash
-# Levantar todo (API + PostgreSQL)
-docker compose up
+# Levantar todo (API + PostgreSQL con pgvector)
+docker compose up --build
 
-# Los logs persisten entre reinicios gracias al bind mount
-docker compose down
-docker compose up  # los logs siguen ahí en ./logs/
-
-# Ejecutar migraciones
+# Ejecutar migraciones (crea todas las tablas: KBs, memoria, tools)
 docker compose exec api alembic upgrade head
 
 # Ver logs en tiempo real
 tail -f logs/application.log
 tail -f logs/rag.log
 tail -f logs/openai.log
+
+# Parar sin borrar datos
+docker compose down
 ```
 
 **Puertos:**
 - API: `http://localhost:8000`
 - Docs interactivas: `http://localhost:8000/docs`
 - PostgreSQL: `localhost:5433`
+
+> **Nota:** Si haces un factory reset de Docker Desktop, la extensión pgvector se pierde.  
+> La migración `eced291ccbe9` incluye `CREATE EXTENSION IF NOT EXISTS vector` para recrearla automáticamente al correr `alembic upgrade head`.
