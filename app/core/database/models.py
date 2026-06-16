@@ -8,9 +8,11 @@ from app.modules.embeddings.models import chunk_embedding_model  # noqa
 from app.modules.agents.models import agent_model  # noqa
 from app.modules.agents.models import agent_knowledge_base_model  # noqa
 from app.modules.memory.models import user_model  # noqa
+from app.modules.memory.models import user_channel_model  # noqa
 from app.modules.memory.models import chat_session_model  # noqa
 from app.modules.memory.models import message_model  # noqa
 from app.modules.memory.models import user_memory_model  # noqa
 from app.modules.memory.models import user_memory_embedding_model  # noqa
 from app.modules.memory.models import conversation_summary_model  # noqa
 from app.modules.memory.models import conversation_summary_embedding_model  # noqa
+from app.modules.tools.models import agent_tool_model  # noqa
