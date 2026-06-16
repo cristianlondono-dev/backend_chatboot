@@ -24,8 +24,13 @@ class ChatSessionRepository:
         )
         return result.scalar_one_or_none()
 
-    async def create(self, agent_id: uuid.UUID, user_id: uuid.UUID) -> ChatSession:
-        session = ChatSession(agent_id=agent_id, user_id=user_id, status="active")
+    async def create(self, agent_id: uuid.UUID, user_id: uuid.UUID, onboarding_step: int | None = None) -> ChatSession:
+        session = ChatSession(
+            agent_id=agent_id,
+            user_id=user_id,
+            status="active",
+            onboarding_step=onboarding_step
+        )
         self.db.add(session)
         await self.db.commit()
         await self.db.refresh(session)
@@ -35,7 +40,7 @@ class ChatSessionRepository:
         await self.db.execute(
             update(ChatSession)
             .where(ChatSession.id == session_id)
-            .values(status="closed", ended_at=func_now())
+            .values(status="closed", ended_at=_now())
         )
         await self.db.commit()
 
@@ -43,18 +48,26 @@ class ChatSessionRepository:
         await self.db.execute(
             update(ChatSession)
             .where(ChatSession.id == session_id)
-            .values(last_message_at=func_now())
+            .values(last_message_at=_now())
+        )
+        await self.db.commit()
+
+    async def advance_onboarding(self, session_id: uuid.UUID, next_step: int | None) -> None:
+        """Set onboarding_step to next_step. Pass None to mark onboarding complete."""
+        await self.db.execute(
+            update(ChatSession)
+            .where(ChatSession.id == session_id)
+            .values(onboarding_step=next_step)
         )
         await self.db.commit()
 
     def is_expired(self, session: ChatSession) -> bool:
-        now = datetime.now(timezone.utc)
+        now = _now()
         last = session.last_message_at
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
-        diff_minutes = (now - last).total_seconds() / 60
-        return diff_minutes > _INACTIVITY_MINUTES
+        return (now - last).total_seconds() / 60 > _INACTIVITY_MINUTES
 
 
-def func_now() -> datetime:
+def _now() -> datetime:
     return datetime.now(timezone.utc)

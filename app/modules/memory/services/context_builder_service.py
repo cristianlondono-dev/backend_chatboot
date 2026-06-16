@@ -19,14 +19,10 @@ class ContextBuilderService:
             "Responde siempre en español de forma clara y útil."
         ]
 
-        # User profile
-        profile_lines: list[str] = []
-        if user.name:
-            profile_lines.append(f"- Nombre: {user.name}")
-        for mem in high_importance_memories:
-            profile_lines.append(f"- {mem.memory}")
-        if profile_lines:
-            sections.append("=== PERFIL DEL USUARIO ===\n" + "\n".join(profile_lines))
+        # User profile — all data lives in high-importance memories
+        if high_importance_memories:
+            lines = [f"- {mem.memory}" for mem in high_importance_memories]
+            sections.append("=== PERFIL DEL USUARIO ===\n" + "\n".join(lines))
 
         # Relevant memories
         if relevant_memories:

@@ -5,9 +5,9 @@ from pydantic import BaseModel
 
 
 class ChatRequest(BaseModel):
-    external_id: str
+    channel: str       # "whatsapp" | "teams" | "webchat" | "slack"
+    channel_id: str    # the identifier in that channel (phone, email, employee_id)
     question: str
-    name: str | None = None
 
 
 class ChatResponse(BaseModel):
