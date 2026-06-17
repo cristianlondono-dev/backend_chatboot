@@ -15,6 +15,14 @@ from app.modules.knowledge_bases.schemas.knowledge_base_schema import AskRequest
 from app.modules.organizations.exceptions.organization_exceptions import (
     OrganizationAlreadyExistsException,
 )
+from app.modules.organizations.repositories.organization_config_repository import (
+    OrganizationConfigRepository,
+)
+from app.modules.organizations.repositories.organization_repository import OrganizationRepository
+from app.modules.organizations.schemas.organization_config_schema import (
+    OrganizationConfigResponse,
+    UpsertOrganizationConfigRequest,
+)
 from app.modules.organizations.schemas.organization_schema import (
     CreateOrganizationRequest,
     OrganizationResponse,
@@ -86,6 +94,44 @@ async def ask_organization(
     answer = await use_case.execute(knowledge_base_ids=kb_ids, question=body.question, top_k=top_k)
 
     return AskResponse(question=body.question, answer=answer)
+
+
+@router.get("/{organization_id}/config", response_model=OrganizationConfigResponse)
+async def get_organization_config(
+    organization_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    org = await OrganizationRepository(db).get_by_id(organization_id)
+    if not org:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organización no encontrada")
+
+    config = await OrganizationConfigRepository(db).get_by_organization(organization_id)
+    if not config:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="La organización no tiene configuración")
+
+    return config
+
+
+@router.put("/{organization_id}/config", response_model=OrganizationConfigResponse)
+async def upsert_organization_config(
+    organization_id: UUID,
+    body: UpsertOrganizationConfigRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    org = await OrganizationRepository(db).get_by_id(organization_id)
+    if not org:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organización no encontrada")
+
+    config = await OrganizationConfigRepository(db).upsert(
+        organization_id=organization_id,
+        openai_api_key=body.openai_api_key,
+        storage_provider=body.storage_provider,
+        storage_credentials=body.storage_credentials,
+        storage_config=body.storage_config,
+    )
+    await db.commit()
+    await db.refresh(config)
+    return config
 
 
 @router.post("/{organization_id}/ask/stream")

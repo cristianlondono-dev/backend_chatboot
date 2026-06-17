@@ -12,21 +12,25 @@ Permite a empresas subir documentos y consultarlos mediante lenguaje natural, co
 3. [Cómo funciona el RAG](#cómo-funciona-el-rag)
 4. [Sistema de memoria](#sistema-de-memoria)
 5. [Módulo de Tools (canales e identidad)](#módulo-de-tools-canales-e-identidad)
-6. [Flujos: interno vs externo](#flujos-interno-vs-externo)
-7. [Los niveles de consulta](#los-niveles-de-consulta)
-8. [Referencia de endpoints](#referencia-de-endpoints)
-   - [Health](#health)
-   - [Organizations](#organizations)
-   - [Knowledge Bases](#knowledge-bases)
-   - [Agents](#agents)
-   - [Chat con memoria](#chat-con-memoria)
-   - [Tools](#tools)
-9. [Flujo completo de ejemplo](#flujo-completo-de-ejemplo)
-10. [Configurar Google Sheets como fuente de empleados](#configurar-google-sheets-como-fuente-de-empleados)
-11. [Formatos de archivo soportados](#formatos-de-archivo-soportados)
-12. [Variables de entorno](#variables-de-entorno)
-13. [Logs](#logs)
-14. [Docker](#docker)
+6. [Tool Actions (acciones ejecutables)](#tool-actions-acciones-ejecutables)
+7. [Configuración multi-tenant](#configuración-multi-tenant)
+8. [Almacenamiento flexible](#almacenamiento-flexible)
+9. [Flujos: interno vs externo](#flujos-interno-vs-externo)
+10. [Los niveles de consulta](#los-niveles-de-consulta)
+11. [Referencia de endpoints](#referencia-de-endpoints)
+    - [Health](#health)
+    - [Organizations](#organizations)
+    - [Knowledge Bases](#knowledge-bases)
+    - [Agents](#agents)
+    - [Chat con memoria](#chat-con-memoria)
+    - [Tools (canales)](#tools-canales)
+    - [Tool Actions](#tool-actions)
+12. [Flujo completo de ejemplo](#flujo-completo-de-ejemplo)
+13. [Configurar Google Sheets como fuente de empleados](#configurar-google-sheets-como-fuente-de-empleados)
+14. [Formatos de archivo soportados](#formatos-de-archivo-soportados)
+15. [Variables de entorno](#variables-de-entorno)
+16. [Logs](#logs)
+17. [Docker](#docker)
 
 ---
 
@@ -219,6 +223,194 @@ Preguntas que el agente hace al nuevo usuario. El campo extra (además de `"ques
 ```
 
 El agente humaniza las preguntas con el LLM — nunca las hace de forma robótica.
+
+---
+
+## Tool Actions (acciones ejecutables)
+
+Los **Tool Actions** son integraciones que el chatbot puede **ejecutar durante una conversación** usando el mecanismo de function calling de OpenAI. Cuando el usuario pide algo como _"confirma mi pedido #1234"_ o _"agenda una reunión para mañana a las 10am"_, el LLM detecta la intención, llama a la acción correspondiente y responde con el resultado real.
+
+### Cómo funciona
+
+```
+Usuario: "¿En qué estado está mi pedido #1234?"
+          ↓
+LLM detecta intención → llama shopify_get_order({order_id: "1234"})
+          ↓
+Sistema ejecuta la acción → Shopify responde con status, tracking, etc.
+          ↓
+LLM recibe el resultado → responde en lenguaje natural:
+"Tu pedido #1234 está en camino 🚚 Número de seguimiento: TRACK-987"
+```
+
+### Action Types disponibles
+
+| `action_type` | Descripción | Servicio |
+|--------------|-------------|----------|
+| `shopify_get_order` | Consulta detalles de un pedido | Shopify Admin API |
+| `shopify_confirm_order` | Confirma/cierra un pedido | Shopify Admin API |
+| `google_calendar_create_event` | Crea un evento en el calendario | Google Calendar API |
+| `google_calendar_list_events` | Lista los próximos eventos | Google Calendar API |
+| `custom_rest` | Llama a cualquier endpoint HTTP externo | Genérico |
+
+### Credenciales y config por action_type
+
+#### `shopify_get_order` / `shopify_confirm_order`
+
+```json
+{
+  "credentials": { "access_token": "shpat_xxxxxxxxxx" },
+  "config": { "store_url": "https://mi-tienda.myshopify.com" }
+}
+```
+
+#### `google_calendar_create_event` / `google_calendar_list_events`
+
+**Opción A — Service Account (recomendado para servidor):**
+```json
+{
+  "credentials": {
+    "service_account_json": {
+      "type": "service_account",
+      "project_id": "mi-proyecto",
+      "private_key_id": "...",
+      "private_key": "-----BEGIN RSA PRIVATE KEY-----\n...",
+      "client_email": "bot@mi-proyecto.iam.gserviceaccount.com"
+    }
+  },
+  "config": {
+    "calendar_id": "user@empresa.com",
+    "timezone": "America/Bogota"
+  }
+}
+```
+
+**Opción B — OAuth2 token de usuario:**
+```json
+{
+  "credentials": { "oauth_token": "ya29.xxxxxxxxxxxxxxxx" },
+  "config": { "calendar_id": "primary", "timezone": "America/Bogota" }
+}
+```
+
+> **Setup Google Calendar**: Crear Service Account en Google Cloud Console → Habilitar Calendar API → Compartir el calendario con el email de la service account (rol: "Hacer cambios en eventos" o "Ver todos los detalles").
+
+#### `custom_rest`
+
+Llama a cualquier endpoint con parámetros del usuario:
+
+```json
+{
+  "credentials": {
+    "headers": { "Authorization": "Bearer TOKEN_SECRETO" }
+  },
+  "config": {
+    "url": "https://api.miapp.com/orders/{order_id}",
+    "method": "GET",
+    "headers": { "Content-Type": "application/json" },
+    "timeout": 10
+  }
+}
+```
+
+Los placeholders `{param_name}` en la URL se reemplazan con los parámetros que el LLM proporciona.
+
+### Dependencias adicionales
+
+Según el action_type que uses, instala las dependencias correspondientes:
+
+```bash
+# Google Calendar
+pip install google-api-python-client google-auth
+
+# AWS S3 (si usas S3 como storage)
+pip install boto3
+
+# Cloudinary (si usas Cloudinary como storage)
+pip install cloudinary
+```
+
+---
+
+## Configuración multi-tenant
+
+En despliegues donde múltiples empresas usan la misma instancia, cada organización puede tener su propio **API key de OpenAI** y su propio **proveedor de almacenamiento**.
+
+### Cómo funciona
+
+- Si la organización tiene configurado `openai_api_key`, ese key se usa para todas las llamadas al LLM (chat, embeddings, extracción de memoria) de esa org.
+- Si no tiene, se usa la variable de entorno global `OPENAI_API_KEY`.
+- Lo mismo aplica para el storage: si hay config de storage en la org, se usa ese provider; si no, se usa Supabase con las vars de entorno globales.
+
+### Endpoint
+
+```
+PUT /organizations/{organization_id}/config
+GET /organizations/{organization_id}/config
+```
+
+**Body — OpenAI propio + Supabase dedicado:**
+```json
+{
+  "openai_api_key": "sk-proj-xxxxxxxx",
+  "storage_provider": "supabase",
+  "storage_credentials": {
+    "url": "https://xyz.supabase.co",
+    "service_key": "eyJhbGci..."
+  },
+  "storage_config": {
+    "bucket_name": "mi-bucket-docs"
+  }
+}
+```
+
+**Body — OpenAI propio + S3:**
+```json
+{
+  "openai_api_key": "sk-proj-xxxxxxxx",
+  "storage_provider": "s3",
+  "storage_credentials": {
+    "access_key_id": "AKIA...",
+    "secret_access_key": "xxxxxxxx"
+  },
+  "storage_config": {
+    "bucket": "mi-bucket",
+    "region": "us-east-1"
+  }
+}
+```
+
+**Body — OpenAI propio + Cloudinary:**
+```json
+{
+  "openai_api_key": "sk-proj-xxxxxxxx",
+  "storage_provider": "cloudinary",
+  "storage_credentials": {
+    "cloud_name": "mi-cloud",
+    "api_key": "123456",
+    "api_secret": "xxxxxxxxxx"
+  },
+  "storage_config": {
+    "folder": "chatbot-docs"
+  }
+}
+```
+
+> **Seguridad**: Los campos `openai_api_key`, `storage_credentials` y tool action `credentials` se guardan como JSON en la base de datos. En producción se recomienda cifrar estas columnas (ej. con `pgcrypto` en Postgres o usando AWS KMS / Vault para la clave de cifrado).
+
+---
+
+## Almacenamiento flexible
+
+El sistema soporta tres proveedores de almacenamiento para los documentos subidos a las Knowledge Bases:
+
+| Provider | Clase | Cuándo usarlo |
+|----------|-------|---------------|
+| `supabase` | `SupabaseStorageService` | Default. Proyecto Supabase existente. |
+| `s3` | `S3StorageService` | AWS, mínimo costo de almacenamiento a escala. |
+| `cloudinary` | `CloudinaryStorageService` | Proyectos que ya usan Cloudinary. |
+
+El proveedor se selecciona automáticamente usando la config de la organización (`PUT /organizations/{id}/config`). Si la org no tiene config, se usa Supabase con las variables de entorno globales.
 
 ---
 
@@ -539,7 +731,7 @@ Memorias de alta importancia extraídas del usuario.
 
 ---
 
-### Tools
+### Tools (canales)
 
 #### `POST /agents/{agent_id}/tools`
 Crea un tool de canal para el agente.
@@ -614,6 +806,221 @@ Desactiva un tool. **Respuesta `204 No Content`**
 
 ---
 
+### Tool Actions
+
+#### `GET /agents/tool-actions/types`
+Lista todos los `action_type` disponibles con sus descripciones y schemas de parámetros por defecto.
+
+**Respuesta `200`**
+```json
+[
+  {
+    "action_type": "shopify_get_order",
+    "default_description": "Consulta el estado y los detalles de un pedido en Shopify...",
+    "default_parameters_schema": { "type": "object", "properties": { "order_id": {...} }, "required": ["order_id"] }
+  },
+  { "action_type": "shopify_confirm_order", "..." : "..." },
+  { "action_type": "google_calendar_create_event", "...": "..." },
+  { "action_type": "google_calendar_list_events", "...": "..." },
+  { "action_type": "custom_rest", "...": "..." }
+]
+```
+
+---
+
+#### `POST /agents/{agent_id}/tool-actions`
+Registra una nueva acción ejecutable para el agente.
+
+Si `parameters_schema` no se envía, se usa el schema por defecto del `action_type`.
+
+**Body — Shopify consultar pedido:**
+```json
+{
+  "name": "consultar_pedido",
+  "action_type": "shopify_get_order",
+  "description": "Consulta el estado de un pedido en nuestra tienda. Úsalo cuando el cliente pregunte por su pedido.",
+  "parameters_schema": {},
+  "credentials": {
+    "access_token": "shpat_xxxxxxxxxxxxxxxxxxx"
+  },
+  "config": {
+    "store_url": "https://mi-tienda.myshopify.com"
+  }
+}
+```
+
+**Body — Google Calendar crear evento:**
+```json
+{
+  "name": "agendar_reunion",
+  "action_type": "google_calendar_create_event",
+  "description": "Agenda una reunión o cita en el calendario. Úsalo cuando el usuario quiera programar un encuentro.",
+  "parameters_schema": {},
+  "credentials": {
+    "service_account_json": { "type": "service_account", "...": "..." }
+  },
+  "config": {
+    "calendar_id": "ventas@empresa.com",
+    "timezone": "America/Bogota"
+  }
+}
+```
+
+**Body — REST custom (consultar inventario propio):**
+```json
+{
+  "name": "consultar_inventario",
+  "action_type": "custom_rest",
+  "description": "Consulta el stock disponible de un producto en nuestro sistema.",
+  "parameters_schema": {
+    "type": "object",
+    "properties": {
+      "sku": { "type": "string", "description": "Código SKU del producto" }
+    },
+    "required": ["sku"]
+  },
+  "credentials": {
+    "headers": { "X-API-Key": "mi-secreto-api-key" }
+  },
+  "config": {
+    "url": "https://api.miempresa.com/inventory/{sku}",
+    "method": "GET"
+  }
+}
+```
+
+**Respuesta `201`**
+```json
+{
+  "id": "action-uuid",
+  "agent_id": "agent-uuid",
+  "name": "consultar_pedido",
+  "action_type": "shopify_get_order",
+  "description": "Consulta el estado de un pedido en nuestra tienda...",
+  "parameters_schema": { "type": "object", "properties": { "order_id": {...} }, "required": ["order_id"] },
+  "config": { "store_url": "https://mi-tienda.myshopify.com" },
+  "is_active": true,
+  "created_at": "2026-06-16T12:00:00Z",
+  "updated_at": "2026-06-16T12:00:00Z"
+}
+```
+
+> **Nota de seguridad**: el campo `credentials` **no se devuelve en las respuestas** para evitar exposición accidental de tokens.
+
+---
+
+#### `GET /agents/{agent_id}/tool-actions`
+Lista todas las tool actions del agente.
+
+---
+
+#### `GET /agents/{agent_id}/tool-actions/{action_id}`
+Obtiene una tool action específica.
+
+---
+
+#### `PUT /agents/{agent_id}/tool-actions/{action_id}`
+Actualiza una tool action (nombre, descripción, schema, config, credenciales, estado).
+
+**Body:**
+```json
+{
+  "name": "consultar_pedido",
+  "description": "...",
+  "parameters_schema": {},
+  "credentials": { "access_token": "nuevo-token" },
+  "config": { "store_url": "https://mi-tienda.myshopify.com" },
+  "is_active": true
+}
+```
+
+---
+
+#### `DELETE /agents/{agent_id}/tool-actions/{action_id}`
+Elimina una tool action. **Respuesta `204 No Content`**
+
+---
+
+#### `POST /agents/{agent_id}/tool-actions/{action_id}/test`
+Ejecuta la acción directamente con los parámetros indicados para verificar credenciales y configuración.
+
+**Body:**
+```json
+{
+  "params": { "order_id": "5678901234" }
+}
+```
+
+**Respuesta exitosa `200`:**
+```json
+{
+  "success": true,
+  "result": {
+    "id": 5678901234,
+    "name": "#1001",
+    "financial_status": "paid",
+    "fulfillment_status": "fulfilled",
+    "total_price": "129000.00",
+    "currency": "COP",
+    "line_items": [{ "title": "Producto A", "quantity": 2, "price": "64500.00" }],
+    "tracking_numbers": ["TRACK-ABC123"]
+  },
+  "error": null
+}
+```
+
+**Respuesta con error `200`:**
+```json
+{
+  "success": false,
+  "result": null,
+  "error": "401 Unauthorized: Invalid access token"
+}
+```
+
+---
+
+### Configuración de la organización (multi-tenant)
+
+#### `PUT /organizations/{organization_id}/config`
+Crea o actualiza la configuración de la organización.
+
+**Body:**
+```json
+{
+  "openai_api_key": "sk-proj-xxxxxxxxxx",
+  "storage_provider": "supabase",
+  "storage_credentials": {
+    "url": "https://xyz.supabase.co",
+    "service_key": "eyJhbGci..."
+  },
+  "storage_config": {
+    "bucket_name": "mis-documentos"
+  }
+}
+```
+
+**Respuesta `200`**
+```json
+{
+  "id": "config-uuid",
+  "organization_id": "org-uuid",
+  "openai_api_key": "sk-proj-xxxxxxxxxx",
+  "storage_provider": "supabase",
+  "storage_credentials": { "url": "...", "service_key": "..." },
+  "storage_config": { "bucket_name": "mis-documentos" },
+  "created_at": "2026-06-16T12:00:00Z",
+  "updated_at": "2026-06-16T12:00:00Z"
+}
+```
+
+---
+
+#### `GET /organizations/{organization_id}/config`
+Obtiene la configuración actual de la organización.
+
+---
+
 ## Flujo completo de ejemplo
 
 ### Caso: Bot interno de RRHH con Google Sheets + Bot externo de ventas
@@ -665,6 +1072,294 @@ POST /agents/agent-rrhh/chat
 POST /agents/agent-ventas/chat
   { "channel": "whatsapp", "channel_id": "+573009876543", "question": "Hola" }
   # ← si es nuevo usuario, arranca el onboarding primero
+
+# 8. (Opcional) Configurar tool actions para el bot de ventas
+# 8a. Consultar acción del pedido en Shopify
+POST /agents/agent-ventas/tool-actions
+  {
+    "name": "consultar_pedido",
+    "action_type": "shopify_get_order",
+    "description": "Consulta el estado de un pedido. Úsalo cuando el cliente pregunte por su pedido.",
+    "credentials": { "access_token": "shpat_xxx" },
+    "config": { "store_url": "https://mi-tienda.myshopify.com" }
+  }
+
+# 8b. Probar que las credenciales funcionan
+POST /agents/agent-ventas/tool-actions/{action_id}/test
+  { "params": { "order_id": "1234" } }
+
+# 8c. Ahora el bot puede responder preguntas como:
+POST /agents/agent-ventas/chat
+  { "channel": "whatsapp", "channel_id": "+573009876543",
+    "question": "¿Dónde está mi pedido 1234?" }
+  # El LLM detecta la intención → llama consultar_pedido → responde con el estado real
+
+# 9. (Opcional) Configurar OpenAI key propia por organización
+PUT /organizations/org-abc/config
+  {
+    "openai_api_key": "sk-proj-empresa-propia",
+    "storage_provider": "s3",
+    "storage_credentials": { "access_key_id": "AKIA...", "secret_access_key": "xxx" },
+    "storage_config": { "bucket": "mis-docs", "region": "us-east-1" }
+  }
+```
+
+---
+
+## Diferencia entre Tools y Tool Actions
+
+| | **Tool (AgentTool)** | **Tool Action** |
+|---|---|---|
+| **¿Qué es?** | Cómo el usuario llega al bot | Qué puede hacer el bot |
+| **Configura** | Canal, identificación, resolver de identidad | Integraciones externas ejecutables |
+| **Ejemplos** | WhatsApp + teléfono, Teams + email | Consultar Shopify, crear evento en Calendar |
+| **Cuándo aplica** | En CADA mensaje (identifica al usuario) | Solo cuando el LLM detecta una intención |
+| **Endpoint** | `POST /agents/{id}/tools` | `POST /agents/{id}/tool-actions` |
+
+Un agente puede tener un Tool de WhatsApp **y** Tool Actions de Shopify + Google Calendar al mismo tiempo, sin conflicto.
+
+```
+Usuario de WhatsApp envía mensaje
+     ↓
+[Tool] Identifica al usuario por teléfono (resolver)
+     ↓
+[Chat] LLM analiza el mensaje
+     ↓ (si detecta intención de acción)
+[Tool Action] Ejecuta la integración → devuelve resultado → LLM responde
+```
+
+---
+
+## Configurar Google Calendar paso a paso
+
+### 1. Crear el proyecto en Google Cloud
+
+1. Ve a [Google Cloud Console](https://console.cloud.google.com)
+2. Crea un nuevo proyecto (o usa uno existente)
+3. En el menú → **APIs y Servicios** → **Biblioteca**
+4. Busca **"Google Calendar API"** → Habilitar
+
+### 2. Crear la Service Account
+
+1. Ve a **IAM y Administración** → **Cuentas de servicio**
+2. Crear cuenta de servicio:
+   - Nombre: `chatbot-calendar`
+   - ID: se genera automáticamente
+3. Roles: no necesita rol especial en Google Cloud (los permisos se dan desde Calendar)
+4. Clic en **Crear clave** → tipo **JSON** → descarga el archivo
+
+El archivo JSON tiene esta forma:
+```json
+{
+  "type": "service_account",
+  "project_id": "mi-proyecto",
+  "private_key_id": "abc123",
+  "private_key": "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n",
+  "client_email": "chatbot-calendar@mi-proyecto.iam.gserviceaccount.com",
+  "client_id": "12345678",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token"
+}
+```
+
+### 3. Compartir el calendario con la Service Account
+
+Para **cada calendario** que quieras que el bot gestione:
+
+1. Abre **Google Calendar** en el navegador
+2. En el panel izquierdo, clic en los 3 puntos del calendario → **Configuración y uso compartido**
+3. Sección **"Compartir con personas específicas"** → Agregar personas
+4. Email: el `client_email` de tu Service Account (ej. `chatbot-calendar@mi-proyecto.iam.gserviceaccount.com`)
+5. Permisos: **"Realizar cambios en eventos"** (para crear/editar/cancelar)
+6. Guarda
+
+### 4. Obtener el Calendar ID
+
+En la misma pantalla de configuración del calendario:  
+Sección **"Integrar el calendario"** → copia el **ID del calendario**
+
+- Calendario personal: `primary` o `usuario@gmail.com`
+- Calendario de empresa: algo como `c_xxxxxxxxxxxxxxxxxxxxxxxxxxxxx@group.calendar.google.com`
+
+### 5. Configurar la Tool Action (multi-sede)
+
+```
+POST /agents/{agent_id}/tool-actions
+```
+
+**Para múltiples sedes/calendarios:**
+
+```json
+{
+  "name": "agendar_cita",
+  "action_type": "google_calendar_create_event",
+  "description": "Agenda una cita o reunión. Sedes disponibles: Sede Centro, Sede Norte, Sede Sur. Pregunta al usuario en cuál sede quiere agendar si no lo especifica.",
+  "parameters_schema": {
+    "type": "object",
+    "properties": {
+      "calendar_name": {
+        "type": "string",
+        "enum": ["Sede Centro", "Sede Norte", "Sede Sur"],
+        "description": "La sede donde agendar la cita."
+      },
+      "title": { "type": "string", "description": "Título de la cita." },
+      "start": { "type": "string", "description": "Fecha y hora de inicio ISO 8601. Ej: '2025-07-15T10:00:00'" },
+      "end": { "type": "string", "description": "Fecha y hora de fin ISO 8601." },
+      "description": { "type": "string", "description": "Notas adicionales (opcional)." }
+    },
+    "required": ["calendar_name", "title", "start", "end"]
+  },
+  "credentials": {
+    "service_account_json": {
+      "type": "service_account",
+      "project_id": "mi-proyecto",
+      "private_key_id": "abc123",
+      "private_key": "-----BEGIN RSA PRIVATE KEY-----\n...",
+      "client_email": "chatbot-calendar@mi-proyecto.iam.gserviceaccount.com"
+    }
+  },
+  "config": {
+    "calendars": [
+      {"id": "c_aaa@group.calendar.google.com", "name": "Sede Centro"},
+      {"id": "c_bbb@group.calendar.google.com", "name": "Sede Norte"},
+      {"id": "c_ccc@group.calendar.google.com", "name": "Sede Sur"}
+    ],
+    "timezone": "America/Bogota",
+    "advance_notice_hours": 1
+  }
+}
+```
+
+Registra también las acciones de listar, cancelar y modificar con el mismo `credentials` y `config`:
+
+```json
+{ "name": "ver_citas",      "action_type": "google_calendar_list_events",  ... }
+{ "name": "cancelar_cita",  "action_type": "google_calendar_cancel_event",  ... }
+{ "name": "modificar_cita", "action_type": "google_calendar_update_event",  ... }
+```
+
+### 6. Probar antes de activar
+
+```
+POST /agents/{agent_id}/tool-actions/{action_id}/test
+{
+  "params": {
+    "calendar_name": "Sede Centro",
+    "title": "Prueba de integración",
+    "start": "2025-12-31T10:00:00",
+    "end": "2025-12-31T11:00:00"
+  }
+}
+```
+
+---
+
+## Regla de 1 hora de anticipación (cancelar/modificar)
+
+Las acciones `google_calendar_cancel_event` y `google_calendar_update_event` verifican automáticamente que el evento empiece en **más de 1 hora**. Si no, devuelven un error amigable al LLM:
+
+```
+"No es posible modificar o cancelar eventos con menos de 1 hora de anticipación.
+ El evento comienza a las 14:30 y son las 14:10 (UTC)."
+```
+
+El LLM relayea este mensaje al usuario de forma natural.  
+Puedes cambiar el umbral por acción con `"advance_notice_hours": 2` en el `config`.
+
+---
+
+## Action Types disponibles (referencia completa)
+
+| `action_type` | Requiere `credentials` | Requiere `config` |
+|---|---|---|
+| `shopify_get_order` | `access_token` | `store_url` |
+| `shopify_confirm_order` | `access_token` | `store_url` |
+| `shopify_list_orders` | `access_token` | `store_url` |
+| `shopify_cancel_order` | `access_token` | `store_url` |
+| `google_calendar_create_event` | `service_account_json` o `oauth_token` | `calendars[]` + `timezone` |
+| `google_calendar_list_events` | `service_account_json` o `oauth_token` | `calendars[]` + `timezone` |
+| `google_calendar_cancel_event` | `service_account_json` o `oauth_token` | `calendars[]` + `timezone` + `advance_notice_hours` |
+| `google_calendar_update_event` | `service_account_json` o `oauth_token` | `calendars[]` + `timezone` + `advance_notice_hours` |
+| `custom_rest` | `headers` (opcionales) | `url`, `method`, `headers` (opcionales) |
+
+---
+
+## Integración Twilio (WhatsApp real)
+
+### 1. Crear cuenta Twilio
+
+1. Regístrate en [twilio.com](https://www.twilio.com)
+2. Ve a **Messaging** → **Try it out** → **Send a WhatsApp message**
+3. Sigue los pasos del sandbox (envía el código de activación desde tu WhatsApp)
+
+Para producción, solicita un número de WhatsApp Business en la misma sección.
+
+### 2. Configurar el webhook
+
+En la consola Twilio → **Messaging** → **WhatsApp Sandbox** (o la config del número):
+
+- **"When a message comes in"**: `https://tudominio.com/webhooks/twilio/whatsapp/{agent_id}`
+- Método: **HTTP POST**
+
+> Para desarrollo local puedes usar [ngrok](https://ngrok.com):
+> ```bash
+> ngrok http 8000
+> # Copia la URL pública, ej: https://abc123.ngrok.io
+> # Webhook: https://abc123.ngrok.io/webhooks/twilio/whatsapp/{agent_id}
+> ```
+
+### 3. Instalar twilio SDK (opcional, para validación de firma)
+
+```bash
+pip install twilio
+```
+
+Añade a `.env`:
+```
+TWILIO_AUTH_TOKEN=tu_auth_token_de_twilio
+```
+
+Sin esta variable el webhook funciona igual pero sin validación de firma (OK para desarrollo).
+
+### 4. Configurar el AgentTool para WhatsApp
+
+El agente debe tener un Tool con `channel="whatsapp"`:
+
+```json
+POST /agents/{agent_id}/tools
+{
+  "channel": "whatsapp",
+  "identifier_type": "phone",
+  "user_type": "external",
+  "resolver_type": "none",
+  "onboarding_questions": [
+    { "question": "¿Cuál es tu nombre?", "memory_key": "nombre" }
+  ]
+}
+```
+
+### 5. Probar
+
+Envía un WhatsApp al número del sandbox de Twilio y el chatbot responderá automáticamente.
+
+### Endpoint del webhook
+
+```
+POST /webhooks/twilio/whatsapp/{agent_id}
+```
+
+Twilio envía (form-encoded):
+```
+From=whatsapp%3A%2B573001234567
+Body=Hola%2C+necesito+ayuda
+```
+
+El servidor responde con TwiML:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>¡Hola! Soy el asistente. ¿En qué puedo ayudarte hoy?</Message>
+</Response>
 ```
 
 ---
@@ -743,6 +1438,8 @@ Los logs se escriben en `./logs/` y se rotan automáticamente cada medianoche (3
 |-----|-------------|
 | `[rag]` | Consultas RAG directas (ask endpoints) |
 | `[chat-memory]` | Llamadas al modelo en el flujo de chat con memoria |
+| `[chat-tools]` | Llamadas al modelo con function calling activo |
+| `[tool-action]` | Ejecución de tool actions (nombre, tipo, parámetros, resultado) |
 | `[resolver:sheets]` | Búsquedas en Google Sheets |
 | `[resolver]` | Llamadas al resolver REST API |
 

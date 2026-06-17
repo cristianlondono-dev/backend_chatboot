@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +22,11 @@ from app.modules.memory.services.onboarding_service import OnboardingService
 from app.modules.memory.services.session_manager_service import SessionManagerService
 from app.modules.memory.services.summarization_service import SummarizationService
 from app.modules.tools.repositories.agent_tool_repository import AgentToolRepository
+from app.modules.tools.repositories.tool_action_repository import ToolActionRepository
 from app.modules.tools.services.identity_resolution_service import IdentityResolutionService
+from app.modules.tools.services.tool_action_executor_service import ToolActionExecutorService
+
+_MAX_TOOL_ROUNDS = 5  # guard against infinite tool-call loops
 
 
 class ChatWithMemoryUseCase:
@@ -36,6 +41,7 @@ class ChatWithMemoryUseCase:
         self.summary_repo = ConversationSummaryRepository(db)
         self.agent_repo = AgentRepository(db)
         self.tool_repo = AgentToolRepository(db)
+        self.tool_action_repo = ToolActionRepository(db)
         self.chunk_repo = ChunkEmbeddingRepository(db)
         self.session_manager = SessionManagerService(db)
         self.summarization = SummarizationService(db)
@@ -44,7 +50,31 @@ class ChatWithMemoryUseCase:
         self.embedding_service = OpenAIEmbeddingService()
         self.memory_extraction = MemoryExtractionService()
         self.identity_service = IdentityResolutionService()
-        self.chat_service = OpenAIChatService()
+        self.tool_executor = ToolActionExecutorService()
+        # chat_service is created lazily in _resolve_chat_service()
+        # so we can inject a per-org API key when available.
+        self._chat_service: OpenAIChatService | None = None
+
+    async def _resolve_chat_service(self, agent_id: uuid.UUID) -> OpenAIChatService:
+        """Return a chat service using the org's OpenAI key, falling back to env."""
+        if self._chat_service is not None:
+            return self._chat_service
+
+        from app.modules.organizations.repositories.organization_config_repository import (
+            OrganizationConfigRepository,
+        )
+
+        agent = await self.agent_repo.get_by_id(agent_id)
+        org_api_key: str | None = None
+        if agent:
+            config = await OrganizationConfigRepository(self.db).get_by_organization(
+                agent.organization_id
+            )
+            if config:
+                org_api_key = config.openai_api_key
+
+        self._chat_service = OpenAIChatService(api_key=org_api_key)
+        return self._chat_service
 
     async def execute(
         self,
@@ -68,7 +98,6 @@ class ChatWithMemoryUseCase:
         # 3. Resolve identity
         resolution = self.identity_service.resolve(tool, channel_id)
         if resolution is None:
-            # Internal user not found in external source → access denied
             application_logger.info(
                 f"[chat] Access denied | agent={agent_id} | channel={channel} | id={channel_id}"
             )
@@ -125,7 +154,6 @@ class ChatWithMemoryUseCase:
         questions = tool.onboarding_questions or []
         step = session.onboarding_step
 
-        # Save memory from this answer using flexible key extraction
         if step < len(questions):
             q = questions[step]
             label = OnboardingService.extract_memory_label(q)
@@ -152,7 +180,6 @@ class ChatWithMemoryUseCase:
                 "answer": response
             }
 
-        # Onboarding complete
         await self.session_repo.advance_onboarding(session.id, None)
         completion = self.onboarding.completion_message()
         await self.message_repo.create(session.id, "assistant", completion)
@@ -164,6 +191,7 @@ class ChatWithMemoryUseCase:
         }
 
     async def _chat(self, agent_id, user_id, session, question: str, top_k: int) -> dict:
+        chat_service = await self._resolve_chat_service(agent_id)
         question_embedding = self.embedding_service.generate_embedding(question)
 
         # Parallel retrieval
@@ -191,7 +219,7 @@ class ChatWithMemoryUseCase:
                 f"  KBs: {[str(k) for k in kb_ids]} | top_k={top_k} | Chunks: {len(rag_results)}"
             )
 
-        # Build prompt and generate response
+        # Build prompt and message list
         user_obj = await self._get_user(user_id)
         system_prompt = self.context_builder.build_system_prompt(
             user=user_obj,
@@ -203,9 +231,52 @@ class ChatWithMemoryUseCase:
         messages = self.context_builder.build_messages(system_prompt, recent_msgs)
         messages.append({"role": "user", "content": question})
 
-        answer = self.chat_service.generate_response_with_messages(messages)
+        # Load active tool actions and convert to OpenAI function definitions
+        tool_actions = await self.tool_action_repo.get_active_by_agent(agent_id)
+        openai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": ta.name,
+                    "description": ta.description,
+                    "parameters": ta.parameters_schema,
+                },
+            }
+            for ta in tool_actions
+        ] if tool_actions else None
 
-        # Persist and post-process
+        # Tool-calling loop — the model may request several rounds of tools
+        answer: str = ""
+        tool_action_map = {ta.name: ta for ta in tool_actions}
+
+        for _ in range(_MAX_TOOL_ROUNDS):
+            result = chat_service.generate_with_tools(messages, openai_tools)
+
+            if not result.has_tool_calls:
+                answer = result.content or ""
+                break
+
+            # Append the assistant's tool-call message so the model keeps context
+            messages.append(result.raw_message)
+
+            # Execute each tool call and append tool-result messages
+            for tc in result.tool_calls:
+                ta = tool_action_map.get(tc.name)
+                if ta:
+                    tool_result = await self.tool_executor.execute(ta, tc.arguments)
+                else:
+                    tool_result = {"error": f"Unknown tool '{tc.name}'"}
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                })
+        else:
+            # Safety net — should never happen with well-behaved models
+            answer = "Lo siento, no pude completar la acción solicitada."
+
+        # Persist messages and post-process
         await self.message_repo.create(session.id, "user", question)
         await self.message_repo.create(session.id, "assistant", answer)
         await self.session_manager.touch(session.id)

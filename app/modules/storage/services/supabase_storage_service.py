@@ -3,17 +3,36 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from app.core.config import settings
+from app.modules.storage.base_storage import BaseStorageService
 
 
-class SupabaseStorageService:
+class SupabaseStorageService(BaseStorageService):
+    """
+    Supabase Storage implementation.
 
-    def __init__(self):
+    When credentials/config dicts are empty the service falls back to the
+    global environment variables (SUPABASE_URL, SUPABASE_SERVICE_KEY,
+    SUPABASE_BUCKET_NAME).
+
+    Credentials keys (optional — override env vars):
+      - url: str
+      - service_key: str
+
+    Config keys (optional):
+      - bucket_name: str
+    """
+
+    def __init__(self, credentials: dict | None = None, config: dict | None = None):
         from supabase import create_client
-        self._client = create_client(
-            settings.SUPABASE_URL,
-            settings.SUPABASE_SERVICE_KEY
-        )
-        self._bucket = settings.SUPABASE_BUCKET_NAME
+
+        creds = credentials or {}
+        cfg = config or {}
+
+        url = creds.get("url") or settings.SUPABASE_URL
+        key = creds.get("service_key") or settings.SUPABASE_SERVICE_KEY
+        self._bucket = cfg.get("bucket_name") or settings.SUPABASE_BUCKET_NAME
+
+        self._client = create_client(url, key)
 
     def upload(
         self,
