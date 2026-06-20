@@ -18,18 +18,31 @@ class AgentRepository:
         organization_id: UUID,
         name: str,
         description: str | None,
-        visibility: str
+        visibility: str,
+        business_type: str = "products",
+        escalation_notes: str | None = None
     ) -> Agent:
         agent = Agent(
             organization_id=organization_id,
             name=name,
             description=description,
-            visibility=visibility
+            visibility=visibility,
+            business_type=business_type,
+            escalation_notes=escalation_notes
         )
         self.db.add(agent)
         await self.db.commit()
         # Reload with relationship so serialization doesn't fail
         return await self._load(agent.id)
+
+    async def update(self, agent_id: UUID, **fields) -> Agent | None:
+        agent = await self.get_by_id(agent_id)
+        if not agent:
+            return None
+        for key, value in fields.items():
+            setattr(agent, key, value)
+        await self.db.commit()
+        return await self._load(agent_id)
 
     async def get_by_id(self, agent_id: UUID) -> Agent | None:
         result = await self.db.execute(
@@ -73,6 +86,10 @@ class AgentRepository:
         )
         await self.db.commit()
         return result.rowcount > 0
+
+    async def delete_by_organization_id(self, organization_id: UUID) -> None:
+        # Cascades at the DB level to agent_knowledge_bases, agent_tools and tool_actions.
+        await self.db.execute(delete(Agent).where(Agent.organization_id == organization_id))
 
     async def get_knowledge_base_ids(self, agent_id: UUID) -> list[UUID]:
         result = await self.db.execute(

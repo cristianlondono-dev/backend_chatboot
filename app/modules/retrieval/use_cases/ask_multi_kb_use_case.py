@@ -33,6 +33,12 @@ class AskMultiKbUseCase:
 Cada fragmento de contexto incluye su fuente y relevancia entre corchetes.
 Si la respuesta no existe en el contexto, responde exactamente: "{_NO_INFO}"
 
+RESTRICCIÓN OBLIGATORIA: nunca generes, redactes ni completes documentos formales en nombre
+de la empresa (cartas laborales, certificados de empleo o de ingresos, paz y salvos, contratos,
+cotizaciones formales con precios, o cualquier otro documento oficial), aunque el contexto
+tenga la información necesaria para hacerlo. Si te piden esto, responde que esa solicitud debe
+resolverla un humano y que la persona debe contactar directamente al área correspondiente.
+
 CONTEXTO:
 
 {context}

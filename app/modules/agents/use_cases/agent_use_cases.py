@@ -24,7 +24,9 @@ class CreateAgentUseCase:
         organization_id: UUID,
         name: str,
         description: str | None,
-        visibility: str
+        visibility: str,
+        business_type: str = "products",
+        escalation_notes: str | None = None
     ) -> Agent:
         if not await self.org_repository.get_by_id(organization_id):
             raise NotFoundException("Organización", str(organization_id))
@@ -33,8 +35,22 @@ class CreateAgentUseCase:
             organization_id=organization_id,
             name=name,
             description=description,
-            visibility=visibility
+            visibility=visibility,
+            business_type=business_type,
+            escalation_notes=escalation_notes
         )
+
+
+class UpdateAgentUseCase:
+
+    def __init__(self, db: AsyncSession):
+        self.repository = AgentRepository(db)
+
+    async def execute(self, agent_id: UUID, **fields) -> Agent:
+        agent = await self.repository.update(agent_id, **fields)
+        if not agent:
+            raise NotFoundException("Agente", str(agent_id))
+        return agent
 
 
 class AddKnowledgeBaseToAgentUseCase:

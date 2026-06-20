@@ -8,6 +8,7 @@ from app.core.exceptions import NotFoundException, UnprocessableException
 from app.core.logging.loggers import application_logger, rag_logger
 from app.modules.agents.repositories.agent_repository import AgentRepository
 from app.modules.embeddings.repositories.chunk_embedding_repository import ChunkEmbeddingRepository
+from app.modules.escalations.repositories.escalation_repository import EscalationRepository
 from app.modules.llm.providers.openai_provider import OpenAIEmbeddingService
 from app.modules.llm.services.openai_chat_service import OpenAIChatService
 from app.modules.memory.repositories.chat_session_repository import ChatSessionRepository
@@ -27,6 +28,8 @@ from app.modules.tools.services.identity_resolution_service import IdentityResol
 from app.modules.tools.services.tool_action_executor_service import ToolActionExecutorService
 
 _MAX_TOOL_ROUNDS = 5  # guard against infinite tool-call loops
+_NICKNAME_STEP = -1  # sentinel onboarding_step: waiting for the preferred-name answer
+_GIVEN_NAME_FIELDS = ("nombre", "nombres", "name", "first_name", "given_name")
 
 
 class ChatWithMemoryUseCase:
@@ -42,6 +45,7 @@ class ChatWithMemoryUseCase:
         self.agent_repo = AgentRepository(db)
         self.tool_repo = AgentToolRepository(db)
         self.tool_action_repo = ToolActionRepository(db)
+        self.escalation_repo = EscalationRepository(db)
         self.chunk_repo = ChunkEmbeddingRepository(db)
         self.session_manager = SessionManagerService(db)
         self.summarization = SummarizationService(db)
@@ -101,44 +105,66 @@ class ChatWithMemoryUseCase:
             application_logger.info(
                 f"[chat] Access denied | agent={agent_id} | channel={channel} | id={channel_id}"
             )
-            raise UnprocessableException(
-                "No estás registrado en el sistema. Contacta al administrador."
-            )
+            raise UnprocessableException(self._access_denied_message(tool.identifier_type))
 
         canonical_id = resolution["canonical_id"]
         profile_memories = resolution["memories"]
+        given_name = resolution.get("given_name")
 
         # 4. Get or create user + link channel
         user, is_new_user = await self.user_repo.get_or_create(canonical_id, tool.user_type)
         await self.channel_repo.link(user.id, channel, channel_id)
 
-        # 5. Store profile memories from resolver (only on first encounter)
-        if is_new_user and profile_memories:
-            for mem in profile_memories:
+        # 5. Store profile memories from resolver — on first encounter this loads
+        # the full profile; for returning users it only backfills columns the
+        # spreadsheet has gained since their last sync (e.g. a newly added
+        # "fecha de contratación" column), without touching already-known fields.
+        if profile_memories:
+            known_fields = await self.memory_repo.get_source_fields(agent_id, user.id)
+            new_memories = [m for m in profile_memories if m["field"] not in known_fields]
+            for mem in new_memories:
                 saved = await self.memory_repo.create(
                     agent_id=agent_id,
                     user_id=user.id,
                     memory=mem["memory"],
-                    importance=mem.get("importance", "high")
+                    importance=mem.get("importance", "high"),
+                    source_field=mem["field"]
                 )
                 emb = self.embedding_service.generate_embedding(mem["memory"])
                 await self.memory_repo.create_embedding(saved.id, "text-embedding-3-small", emb)
-            application_logger.info(
-                f"[chat] Profile loaded from resolver | user={user.id} | memories={len(profile_memories)}"
-            )
+            if new_memories:
+                application_logger.info(
+                    f"[chat] Profile synced from resolver | user={user.id} "
+                    f"| new_fields={len(new_memories)} | is_new_user={is_new_user}"
+                )
 
         # 6. Get or create session (auto-close if inactive >30min)
         session = await self.session_manager.get_or_create(agent_id, user.id)
 
-        # 7. Handle onboarding (external users only, when questions are configured)
-        if session.onboarding_step is not None:
-            return await self._handle_onboarding(agent_id, user.id, session, tool, question)
+        # 6b. A human is currently attending this conversation from the
+        # Escalamientos panel — the bot stays silent: just persist the
+        # message and bail out, no onboarding, no LLM.
+        if session.is_paused:
+            await self.message_repo.create(session.id, "user", question)
+            await self.session_manager.touch(session.id)
+            return {
+                "session_id": session.id,
+                "user_id": user.id,
+                "question": question,
+                "answer": ""
+            }
 
-        # 8. Check if new external user needs onboarding
-        questions = tool.onboarding_questions or []
-        if is_new_user and tool.user_type == "external" and questions:
-            await self.session_repo.advance_onboarding(session.id, 0)
-            greeting = self.onboarding.greeting_with_question(question, questions[0]["question"])
+        # 7. Continue a pending nickname question or tool onboarding
+        if session.onboarding_step == _NICKNAME_STEP:
+            return await self._handle_nickname_answer(agent_id, user.id, session, top_k, question)
+        if session.onboarding_step is not None:
+            return await self._handle_onboarding(agent_id, user.id, session, tool, top_k, question)
+
+        # 8. New internal user with a compound first name (e.g. "Cristian Camilo") —
+        # ask how they want to be addressed before anything else
+        if is_new_user and tool.user_type == "internal" and given_name and len(given_name.split()) > 1:
+            await self.session_repo.advance_onboarding(session.id, _NICKNAME_STEP)
+            greeting = self.onboarding.nickname_greeting(question, given_name)
             await self.message_repo.create(session.id, "assistant", greeting)
             return {
                 "session_id": session.id,
@@ -147,31 +173,116 @@ class ChatWithMemoryUseCase:
                 "answer": greeting
             }
 
-        # 9. Normal chat flow
+        # 9. Check if new external user needs onboarding
+        questions = tool.onboarding_questions or []
+        if is_new_user and tool.user_type == "external" and questions:
+            extracted = self.onboarding.extract_answers(questions, question)
+            for label, value in extracted.items():
+                await self._save_onboarding_answer(agent_id, user.id, label, value)
+
+            next_index = self._first_unanswered_index(questions, extracted)
+            if next_index < len(questions):
+                await self.session_repo.advance_onboarding(session.id, next_index)
+                greeting = self.onboarding.greeting_with_question(question, questions[next_index]["question"])
+                await self.message_repo.create(session.id, "assistant", greeting)
+                return {
+                    "session_id": session.id,
+                    "user_id": user.id,
+                    "question": question,
+                    "answer": greeting
+                }
+
+            # El usuario ya respondió todo en su primer mensaje — no hay nada
+            # que preguntar, cae al flujo normal de chat (paso 10) sin retornar aquí.
+            await self.session_repo.advance_onboarding(session.id, None)
+
+        # 10. Normal chat flow
         return await self._chat(agent_id, user.id, session, question, top_k)
 
-    async def _handle_onboarding(self, agent_id, user_id, session, tool, user_answer: str) -> dict:
+    @staticmethod
+    def _access_denied_message(identifier_type: str) -> str:
+        identified_by = {
+            "phone": "tu número de celular",
+            "email": "tu correo",
+        }.get(identifier_type, "tus datos")
+        return (
+            f"No encontré {identified_by} registrado(a) como parte de la empresa. "
+            "Si eres nuevo o crees que esto es un error, por favor contacta a Recursos Humanos "
+            "para que te ayuden a registrarte."
+        )
+
+    async def _handle_nickname_answer(self, agent_id, user_id, session, top_k: int, user_answer: str) -> dict:
+        high_mems = await self.memory_repo.get_high_importance(agent_id, user_id)
+        full_name = self._find_memory_value(high_mems, _GIVEN_NAME_FIELDS)
+
+        nickname = self.onboarding.extract_nickname(full_name or "", user_answer)
+        memory_text = f"userName: {nickname}"
+        saved = await self.memory_repo.create(
+            agent_id=agent_id, user_id=user_id,
+            memory=memory_text, importance="high"
+        )
+        emb = self.embedding_service.generate_embedding(memory_text)
+        await self.memory_repo.create_embedding(saved.id, "text-embedding-3-small", emb)
+
+        await self.session_repo.advance_onboarding(session.id, None)
+
+        # The reply may carry more than just the chosen name (e.g. a question
+        # asked in the same message) — let the normal chat flow handle it
+        # instead of discarding it behind a canned confirmation.
+        return await self._chat(agent_id, user_id, session, user_answer, top_k)
+
+    @staticmethod
+    def _find_memory_value(memories, labels: tuple[str, ...]) -> str | None:
+        by_label = {}
+        for mem in memories:
+            label, _, value = mem.memory.partition(":")
+            by_label[label.strip().lower()] = value.strip()
+        return next((by_label[label] for label in labels if label in by_label), None)
+
+    async def _save_onboarding_answer(self, agent_id, user_id, label: str, value: str) -> None:
+        """Persists one extracted onboarding answer as a high-importance memory —
+        same pattern used for every onboarding answer, manual or extracted."""
+        memory_text = f"{label}: {value}"
+        saved = await self.memory_repo.create(
+            agent_id=agent_id, user_id=user_id,
+            memory=memory_text, importance="high"
+        )
+        emb = self.embedding_service.generate_embedding(memory_text)
+        await self.memory_repo.create_embedding(saved.id, "text-embedding-3-small", emb)
+
+    @staticmethod
+    def _first_unanswered_index(questions: list[dict], answered_labels) -> int:
+        """Index of the first question in `questions` whose label is NOT in
+        `answered_labels`, or len(questions) if all of them are answered."""
+        for i, q in enumerate(questions):
+            if OnboardingService.extract_memory_label(q) not in answered_labels:
+                return i
+        return len(questions)
+
+    async def _handle_onboarding(self, agent_id, user_id, session, tool, top_k: int, user_answer: str) -> dict:
         questions = tool.onboarding_questions or []
         step = session.onboarding_step
+        pending = questions[step:]
 
-        if step < len(questions):
-            q = questions[step]
-            label = OnboardingService.extract_memory_label(q)
-            memory_text = f"{label}: {user_answer}"
-            saved = await self.memory_repo.create(
-                agent_id=agent_id, user_id=user_id,
-                memory=memory_text, importance="high"
-            )
-            emb = self.embedding_service.generate_embedding(memory_text)
-            await self.memory_repo.create_embedding(saved.id, "text-embedding-3-small", emb)
-            await self.message_repo.create(session.id, "user", user_answer)
+        extracted = self.onboarding.extract_answers(pending, user_answer)
 
-        next_step = step + 1
+        # La pregunta de ESTE turno siempre debe quedar respondida, aunque la
+        # extracción no la haya identificado — respaldo con el texto crudo,
+        # igual que el comportamiento de una sola pregunta de antes.
+        current_label = OnboardingService.extract_memory_label(questions[step])
+        if current_label not in extracted:
+            extracted[current_label] = user_answer
 
-        if next_step < len(questions):
-            await self.session_repo.advance_onboarding(session.id, next_step)
-            next_q_text = questions[next_step]["question"]
+        for label, value in extracted.items():
+            await self._save_onboarding_answer(agent_id, user_id, label, value)
+
+        next_index = self._first_unanswered_index(questions, extracted)
+
+        if next_index < len(questions):
+            await self.session_repo.advance_onboarding(session.id, next_index)
+            next_q_text = questions[next_index]["question"]
             response = self.onboarding.transition_with_question(user_answer, next_q_text)
+            await self.message_repo.create(session.id, "user", user_answer)
             await self.message_repo.create(session.id, "assistant", response)
             return {
                 "session_id": session.id,
@@ -180,15 +291,13 @@ class ChatWithMemoryUseCase:
                 "answer": response
             }
 
+        # Nada más que preguntar — delega al chat normal (LLM + tools +
+        # guardrails) en vez de un mensaje de cierre genérico, mismo patrón
+        # que _handle_nickname_answer. _chat() ya persiste el mensaje de
+        # usuario (después del loop de tool-calling), por eso NO se guarda
+        # aquí también en esta rama.
         await self.session_repo.advance_onboarding(session.id, None)
-        completion = self.onboarding.completion_message()
-        await self.message_repo.create(session.id, "assistant", completion)
-        return {
-            "session_id": session.id,
-            "user_id": user_id,
-            "question": user_answer,
-            "answer": completion
-        }
+        return await self._chat(agent_id, user_id, session, user_answer, top_k)
 
     async def _chat(self, agent_id, user_id, session, question: str, top_k: int) -> dict:
         chat_service = await self._resolve_chat_service(agent_id)
@@ -220,13 +329,16 @@ class ChatWithMemoryUseCase:
             )
 
         # Build prompt and message list
+        agent = await self.agent_repo.get_by_id(agent_id)
         user_obj = await self._get_user(user_id)
         system_prompt = self.context_builder.build_system_prompt(
             user=user_obj,
             high_importance_memories=high_mems,
             relevant_memories=rel_mems,
             relevant_summaries=rel_sums,
-            rag_context=rag_context
+            rag_context=rag_context,
+            business_type=agent.business_type,
+            escalation_notes=agent.escalation_notes
         )
         messages = self.context_builder.build_messages(system_prompt, recent_msgs)
         messages.append({"role": "user", "content": question})
@@ -264,6 +376,14 @@ class ChatWithMemoryUseCase:
                 ta = tool_action_map.get(tc.name)
                 if ta:
                     tool_result = await self.tool_executor.execute(ta, tc.arguments)
+                    if ta.action_type == "human_handoff":
+                        await self.escalation_repo.create(
+                            agent_id=agent_id,
+                            user_id=user_id,
+                            session_id=session.id,
+                            tool_action_id=ta.id,
+                            summary=tc.arguments.get("resumen", ""),
+                        )
                 else:
                     tool_result = {"error": f"Unknown tool '{tc.name}'"}
 

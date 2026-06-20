@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.organizations.models.organization_model import Organization
@@ -45,6 +45,14 @@ class OrganizationRepository:
     
     async def get_by_id(self, organization_id: UUID) -> Organization | None:
         return await self.db.get(Organization, organization_id)
+
+    async def get_all(self) -> list[Organization]:
+        query = select(Organization).order_by(Organization.created_at.desc())
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+
+    async def delete(self, organization_id: UUID) -> None:
+        await self.db.execute(delete(Organization).where(Organization.id == organization_id))
 
     async def get_by_tax_id(
         self,

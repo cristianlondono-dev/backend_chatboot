@@ -1,4 +1,5 @@
 import json
+import re
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -7,6 +8,15 @@ from app.modules.tools.resolvers.base_resolver import BaseResolver
 from app.core.logging.loggers import application_logger, error_logger
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+# Matches phone-like identifiers (digits with optional +, spaces, dashes) so we
+# can fall back to a digits-only comparison — WhatsApp sends "+57XXXXXXXXXX"
+# but spreadsheets commonly store the local number without the country code.
+_PHONE_LIKE = re.compile(r"^\+?[\d\s-]{7,}$")
+
+
+def _digits_only(value: str) -> str:
+    return re.sub(r"\D", "", value)
 
 
 class GoogleSheetsResolver(BaseResolver):
@@ -45,9 +55,22 @@ class GoogleSheetsResolver(BaseResolver):
             records = worksheet.get_all_records()
 
             identifier_clean = identifier.strip().lower()
+            identifier_is_phone = bool(_PHONE_LIKE.match(identifier_clean))
+
             for record in records:
                 cell = str(record.get(self.identifier_column, "")).strip().lower()
-                if cell == identifier_clean:
+                is_match = cell == identifier_clean
+                if not is_match and identifier_is_phone and _PHONE_LIKE.match(cell):
+                    # Tolerate a missing/extra country code on either side
+                    # (e.g. sheet has "3245773123", WhatsApp sends "+573245773123")
+                    cell_digits = _digits_only(cell)
+                    identifier_digits = _digits_only(identifier_clean)
+                    is_match = (
+                        len(cell_digits) >= 7
+                        and len(identifier_digits) >= 7
+                        and cell_digits[-10:] == identifier_digits[-10:]
+                    )
+                if is_match:
                     application_logger.info(
                         f"[resolver:sheets] Found identifier={identifier} "
                         f"in spreadsheet={self.spreadsheet_id}"

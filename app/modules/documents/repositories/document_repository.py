@@ -1,5 +1,6 @@
 from uuid import UUID
 
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.documents.models.document_model import Document
@@ -66,3 +67,17 @@ class DocumentRepository:
                 document.chunks_total = chunks_total
 
             await self.db.commit()
+
+    async def get_by_knowledge_base_id(self, knowledge_base_id: UUID) -> list[Document]:
+        query = (
+            select(Document)
+            .where(Document.knowledge_base_id == knowledge_base_id)
+            .order_by(Document.created_at.desc())
+        )
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+
+    async def delete_by_knowledge_base_id(self, knowledge_base_id: UUID) -> None:
+        await self.db.execute(
+            delete(Document).where(Document.knowledge_base_id == knowledge_base_id)
+        )

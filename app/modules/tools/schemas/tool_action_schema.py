@@ -17,6 +17,8 @@ ActionType = Literal[
     "google_calendar_update_event",
     # Generic
     "custom_rest",
+    # Escalation
+    "human_handoff",
 ]
 
 

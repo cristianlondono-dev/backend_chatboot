@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import DateTime, ForeignKey, String, func
+from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -38,6 +38,20 @@ class Agent(Base):
         String(50),
         nullable=False,
         default="internal"
+    )
+
+    # "products" | "services" | "both" — controla cómo escala el bot ante
+    # consultas de venta (ver context_builder_service.py).
+    business_type: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="products"
+    )
+
+    # Reglas de escalamiento adicionales en texto libre, específicas de este negocio.
+    escalation_notes: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True
     )
 
     created_at: Mapped[DateTime] = mapped_column(

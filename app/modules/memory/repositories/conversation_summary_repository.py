@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.memory.models.conversation_summary_model import ConversationSummary
@@ -27,6 +27,11 @@ class ConversationSummaryRepository:
         await self.db.commit()
         await self.db.refresh(obj)
         return obj
+
+    async def delete_by_agent_ids(self, agent_ids: list[uuid.UUID]) -> None:
+        if not agent_ids:
+            return
+        await self.db.execute(delete(ConversationSummary).where(ConversationSummary.agent_id.in_(agent_ids)))
 
     async def search_similar(
         self,

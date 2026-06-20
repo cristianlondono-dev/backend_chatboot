@@ -100,6 +100,42 @@ class OpenAIChatService:
         )
         return response.choices[0].message.content
 
+    def generate_json(self, prompt: str) -> dict:
+        """
+        Same as generate_response() but requests JSON mode from the model and
+        parses the result. Extraction is a "nice to have" — malformed/empty
+        output returns {} instead of raising, so callers can degrade
+        gracefully. API/network errors still propagate, same as the other
+        methods here; swallowing those to keep a flow alive is a decision for
+        the caller (see OnboardingService.extract_answers).
+        """
+        try:
+            response = self.client.chat.completions.create(
+                model=_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+        except Exception as exc:
+            error_logger.error(
+                f"OpenAI chat error: {type(exc).__name__}: {exc}",
+                exc_info=True
+            )
+            raise
+
+        usage = response.usage
+        cost = _chat_cost(_MODEL, usage.prompt_tokens, usage.completion_tokens)
+        openai_logger.info(
+            f"[chat-json] model={_MODEL} | input={usage.prompt_tokens} | output={usage.completion_tokens} "
+            f"| total={usage.total_tokens} | cost=${cost:.6f}"
+        )
+
+        content = response.choices[0].message.content
+        try:
+            parsed = json.loads(content) if content else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
     async def generate_response_stream(self, prompt: str) -> AsyncGenerator[str, None]:
         try:
             stream = await self.async_client.chat.completions.create(

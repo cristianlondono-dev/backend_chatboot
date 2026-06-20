@@ -8,6 +8,7 @@ from app.modules.tools.actions.google_calendar.list_events_action import GoogleC
 from app.modules.tools.actions.google_calendar.cancel_event_action import GoogleCalendarCancelEventAction
 from app.modules.tools.actions.google_calendar.update_event_action import GoogleCalendarUpdateEventAction
 from app.modules.tools.actions.custom_rest.custom_rest_action import CustomRestAction
+from app.modules.tools.actions.human_handoff.human_handoff_action import HumanHandoffAction
 
 _REGISTRY: dict[str, type[BaseAction]] = {
     # ── Shopify ──────────────────────────────────────────────────────────────
@@ -22,6 +23,8 @@ _REGISTRY: dict[str, type[BaseAction]] = {
     GoogleCalendarUpdateEventAction.ACTION_TYPE: GoogleCalendarUpdateEventAction,
     # ── Generic ──────────────────────────────────────────────────────────────
     CustomRestAction.ACTION_TYPE: CustomRestAction,
+    # ── Escalation ───────────────────────────────────────────────────────────
+    HumanHandoffAction.ACTION_TYPE: HumanHandoffAction,
 }
 
 

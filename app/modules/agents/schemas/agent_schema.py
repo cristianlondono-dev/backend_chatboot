@@ -10,6 +10,16 @@ class CreateAgentRequest(BaseModel):
     name: str
     description: str | None = None
     visibility: Literal["internal", "external", "both"] = "internal"
+    business_type: Literal["products", "services", "both"] = "products"
+    escalation_notes: str | None = None
+
+
+class UpdateAgentRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    visibility: Literal["internal", "external", "both"] | None = None
+    business_type: Literal["products", "services", "both"] | None = None
+    escalation_notes: str | None = None
 
 
 class AddKnowledgeBaseRequest(BaseModel):
@@ -31,6 +41,8 @@ class AgentResponse(BaseModel):
     name: str
     description: str | None
     visibility: str
+    business_type: str
+    escalation_notes: str | None
     created_at: datetime
     knowledge_bases: list[AgentKnowledgeBaseInfo]
 

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database.database import get_db
+from app.core.exceptions import NotFoundException, UnprocessableException
 from app.core.logging.loggers import application_logger, error_logger
 from app.modules.memory.use_cases.chat_with_memory_use_case import ChatWithMemoryUseCase
 
@@ -106,6 +107,10 @@ async def twilio_whatsapp_webhook(
             question=message,
         )
         answer = result.get("answer", "Lo siento, no pude procesar tu mensaje.")
+    except (NotFoundException, UnprocessableException) as exc:
+        # Expected domain errors (e.g. "not registered") carry a message
+        # that's already meant for the end user.
+        answer = str(exc)
     except Exception as exc:
         error_logger.error(
             f"[twilio] Error processing message | agent={agent_id} | from={phone}: {exc}",

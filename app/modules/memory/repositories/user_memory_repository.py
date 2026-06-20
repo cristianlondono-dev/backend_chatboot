@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.memory.models.user_memory_model import UserMemory
@@ -14,12 +14,33 @@ class UserMemoryRepository:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    async def create(self, agent_id: uuid.UUID, user_id: uuid.UUID, memory: str, importance: str = "medium") -> UserMemory:
-        obj = UserMemory(agent_id=agent_id, user_id=user_id, memory=memory, importance=importance)
+    async def create(
+        self,
+        agent_id: uuid.UUID,
+        user_id: uuid.UUID,
+        memory: str,
+        importance: str = "medium",
+        source_field: str | None = None
+    ) -> UserMemory:
+        obj = UserMemory(
+            agent_id=agent_id, user_id=user_id, memory=memory,
+            importance=importance, source_field=source_field
+        )
         self.db.add(obj)
         await self.db.commit()
         await self.db.refresh(obj)
         return obj
+
+    async def get_source_fields(self, agent_id: uuid.UUID, user_id: uuid.UUID) -> set[str]:
+        """Resolver column names already stored as memories for this user."""
+        result = await self.db.execute(
+            select(UserMemory.source_field).where(
+                UserMemory.agent_id == agent_id,
+                UserMemory.user_id == user_id,
+                UserMemory.source_field.is_not(None)
+            )
+        )
+        return set(result.scalars().all())
 
     async def create_embedding(self, memory_id: uuid.UUID, model_name: str, embedding: list[float]) -> UserMemoryEmbedding:
         obj = UserMemoryEmbedding(memory_id=memory_id, model_name=model_name, embedding=embedding)
@@ -27,6 +48,11 @@ class UserMemoryRepository:
         await self.db.commit()
         await self.db.refresh(obj)
         return obj
+
+    async def delete_by_agent_ids(self, agent_ids: list[uuid.UUID]) -> None:
+        if not agent_ids:
+            return
+        await self.db.execute(delete(UserMemory).where(UserMemory.agent_id.in_(agent_ids)))
 
     async def get_high_importance(self, agent_id: uuid.UUID, user_id: uuid.UUID) -> list[UserMemory]:
         result = await self.db.execute(

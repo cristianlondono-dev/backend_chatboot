@@ -11,7 +11,11 @@ from app.modules.agents.schemas.agent_schema import AgentResponse
 from app.modules.knowledge_bases.repositories.knowledge_base_repository import (
     KnowledgeBaseRepository,
 )
-from app.modules.knowledge_bases.schemas.knowledge_base_schema import AskRequest, AskResponse
+from app.modules.knowledge_bases.schemas.knowledge_base_schema import (
+    AskRequest,
+    AskResponse,
+    KnowledgeBaseResponse,
+)
 from app.modules.organizations.exceptions.organization_exceptions import (
     OrganizationAlreadyExistsException,
 )
@@ -29,6 +33,9 @@ from app.modules.organizations.schemas.organization_schema import (
 )
 from app.modules.organizations.use_cases.create_organization_use_case import (
     CreateOrganizationUseCase,
+)
+from app.modules.organizations.use_cases.delete_organization_use_case import (
+    DeleteOrganizationUseCase,
 )
 from app.modules.retrieval.use_cases.ask_multi_kb_use_case import AskMultiKbUseCase
 
@@ -62,6 +69,32 @@ async def create_organization(
     return organization
 
 
+@router.get("", response_model=list[OrganizationResponse])
+async def list_organizations(
+    db: AsyncSession = Depends(get_db)
+):
+    return await OrganizationRepository(db).get_all()
+
+
+@router.get("/{organization_id}", response_model=OrganizationResponse)
+async def get_organization(
+    organization_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    organization = await OrganizationRepository(db).get_by_id(organization_id)
+    if not organization:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organización no encontrada")
+    return organization
+
+
+@router.delete("/{organization_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_organization(
+    organization_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    await DeleteOrganizationUseCase(db).execute(organization_id)
+
+
 @router.get("/{organization_id}/agents", response_model=list[AgentResponse])
 async def list_organization_agents(
     organization_id: UUID,
@@ -69,6 +102,15 @@ async def list_organization_agents(
 ):
     repo = AgentRepository(db)
     return await repo.get_by_organization_id(organization_id)
+
+
+@router.get("/{organization_id}/knowledge-bases", response_model=list[KnowledgeBaseResponse])
+async def list_organization_knowledge_bases(
+    organization_id: UUID,
+    area: str | None = Query(default=None, description="Filtrar por área/departamento"),
+    db: AsyncSession = Depends(get_db)
+):
+    return await KnowledgeBaseRepository(db).get_by_organization_id(organization_id, area=area)
 
 
 @router.post("/{organization_id}/ask", response_model=AskResponse)

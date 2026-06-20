@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.memory.models.chat_session_model import ChatSession
@@ -52,6 +52,14 @@ class ChatSessionRepository:
         )
         await self.db.commit()
 
+    async def set_paused(self, session_id: uuid.UUID, is_paused: bool) -> None:
+        await self.db.execute(
+            update(ChatSession)
+            .where(ChatSession.id == session_id)
+            .values(is_paused=is_paused)
+        )
+        await self.db.commit()
+
     async def advance_onboarding(self, session_id: uuid.UUID, next_step: int | None) -> None:
         """Set onboarding_step to next_step. Pass None to mark onboarding complete."""
         await self.db.execute(
@@ -60,6 +68,11 @@ class ChatSessionRepository:
             .values(onboarding_step=next_step)
         )
         await self.db.commit()
+
+    async def delete_by_agent_ids(self, agent_ids: list[uuid.UUID]) -> None:
+        if not agent_ids:
+            return
+        await self.db.execute(delete(ChatSession).where(ChatSession.agent_id.in_(agent_ids)))
 
     def is_expired(self, session: ChatSession) -> bool:
         now = _now()

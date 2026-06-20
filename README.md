@@ -13,11 +13,12 @@ Permite a empresas subir documentos y consultarlos mediante lenguaje natural, co
 4. [Sistema de memoria](#sistema-de-memoria)
 5. [Módulo de Tools (canales e identidad)](#módulo-de-tools-canales-e-identidad)
 6. [Tool Actions (acciones ejecutables)](#tool-actions-acciones-ejecutables)
-7. [Configuración multi-tenant](#configuración-multi-tenant)
-8. [Almacenamiento flexible](#almacenamiento-flexible)
-9. [Flujos: interno vs externo](#flujos-interno-vs-externo)
-10. [Los niveles de consulta](#los-niveles-de-consulta)
-11. [Referencia de endpoints](#referencia-de-endpoints)
+7. [Restricciones de negocio y escalamiento a humano](#restricciones-de-negocio-y-escalamiento-a-humano)
+8. [Configuración multi-tenant](#configuración-multi-tenant)
+9. [Almacenamiento flexible](#almacenamiento-flexible)
+10. [Flujos: interno vs externo](#flujos-interno-vs-externo)
+11. [Los niveles de consulta](#los-niveles-de-consulta)
+12. [Referencia de endpoints](#referencia-de-endpoints)
     - [Health](#health)
     - [Organizations](#organizations)
     - [Knowledge Bases](#knowledge-bases)
@@ -25,12 +26,13 @@ Permite a empresas subir documentos y consultarlos mediante lenguaje natural, co
     - [Chat con memoria](#chat-con-memoria)
     - [Tools (canales)](#tools-canales)
     - [Tool Actions](#tool-actions)
-12. [Flujo completo de ejemplo](#flujo-completo-de-ejemplo)
-13. [Configurar Google Sheets como fuente de empleados](#configurar-google-sheets-como-fuente-de-empleados)
-14. [Formatos de archivo soportados](#formatos-de-archivo-soportados)
-15. [Variables de entorno](#variables-de-entorno)
-16. [Logs](#logs)
-17. [Docker](#docker)
+    - [Escalations (panel de atención humana)](#escalations-panel-de-atención-humana)
+13. [Flujo completo de ejemplo](#flujo-completo-de-ejemplo)
+14. [Configurar Google Sheets como fuente de empleados](#configurar-google-sheets-como-fuente-de-empleados)
+15. [Formatos de archivo soportados](#formatos-de-archivo-soportados)
+16. [Variables de entorno](#variables-de-entorno)
+17. [Logs](#logs)
+18. [Docker](#docker)
 
 ---
 
@@ -72,15 +74,25 @@ Organization
 Agent
   └── AgentKnowledgeBase (N)            KBs vinculadas al agente
   └── AgentTool (N)                     configuración por canal
+  └── business_type                     "products" | "services" | "both" (ver más abajo)
+  └── escalation_notes                  reglas de escalamiento en texto libre, opcionales
 
 User (cross-canal)
   ├── canonical_id                      ID estable (employee_id o teléfono)
   ├── UserChannel (N)                   mapeo canal → usuario (whatsapp, teams, etc.)
   └── Por agente:
         ├── ChatSession                 sesión activa (auto-cierra a 30 min)
-        │     └── Message (N)           historial completo
+        │     ├── is_paused             true mientras un humano atiende desde el panel
+        │     └── Message (N)           historial completo (role: user/assistant/human)
         ├── UserMemory (N)              hechos extraídos por el LLM
+        │     └── source_field          columna del resolver que originó la memoria (o null)
         └── ConversationSummary (N)     resúmenes auto-generados (cada 100 msgs)
+
+Escalation                              conversación que el bot pasó a un humano
+  ├── agent_id / user_id / session_id
+  ├── tool_action_id                    la Tool Action human_handoff que disparó el escalamiento
+  ├── summary                           resumen generado por el LLM
+  └── is_resolved / resolved_at
 ```
 
 ---
@@ -111,9 +123,9 @@ Cada conversación se asocia a un usuario identificado por canal. La memoria per
 
 | Componente | Descripción |
 |------------|-------------|
-| **ChatSession** | Sesión activa por agente+usuario. Se cierra automáticamente tras 30 min de inactividad. |
-| **Message** | Cada turno (user/assistant) guardado con timestamp y token count. |
-| **UserMemory** | Hechos extraídos del usuario por el LLM (`"Trabaja en Bogotá"`, `"Le interesa el producto X"`). Importancia: `low / medium / high`. |
+| **ChatSession** | Sesión activa por agente+usuario. Se cierra automáticamente tras 30 min de inactividad. Tiene `is_paused`: mientras un humano la atiende desde el panel de Escalations, el bot no genera respuestas automáticas (ver [Restricciones de negocio y escalamiento a humano](#restricciones-de-negocio-y-escalamiento-a-humano)). |
+| **Message** | Cada turno guardado con timestamp y token count. `role` es `user`, `assistant`, o `human` (mensaje escrito por un agente humano desde el panel — se traduce a `assistant` solo al construir el contexto para OpenAI, nunca se le manda "human" como rol a la API). |
+| **UserMemory** | Hechos extraídos del usuario por el LLM (`"Trabaja en Bogotá"`, `"Le interesa el producto X"`). Importancia: `low / medium / high`. Las memorias que vienen de un resolver (Google Sheets / REST) llevan `source_field` con el nombre de la columna de origen — esto permite que, si agregas una columna nueva a tu hoja de cálculo, el sistema la sincronice automáticamente para usuarios que ya existían (sin esto, solo los usuarios nuevos verían la columna). |
 | **ConversationSummary** | Resumen automático generado cada 100 mensajes para comprimir el historial. |
 
 ### Construcción del contexto
@@ -252,6 +264,7 @@ LLM recibe el resultado → responde en lenguaje natural:
 | `google_calendar_create_event` | Crea un evento en el calendario | Google Calendar API |
 | `google_calendar_list_events` | Lista los próximos eventos | Google Calendar API |
 | `custom_rest` | Llama a cualquier endpoint HTTP externo | Genérico |
+| `human_handoff` | Escala la conversación a un humano (notifica opcionalmente vía webhook y deja el caso registrado en `/escalations`) | Genérico — ver [Restricciones de negocio y escalamiento a humano](#restricciones-de-negocio-y-escalamiento-a-humano) |
 
 ### Credenciales y config por action_type
 
@@ -329,6 +342,69 @@ pip install boto3
 # Cloudinary (si usas Cloudinary como storage)
 pip install cloudinary
 ```
+
+---
+
+## Restricciones de negocio y escalamiento a humano
+
+El sistema tiene una capa de reglas que decide cuándo el bot puede responder por sí mismo y cuándo debe pasar la conversación a un humano. Combina una **base de seguridad fija** (igual para todos los agentes, no configurable) con **reglas por agente** (configurables).
+
+### Base de seguridad fija
+
+Inyectada siempre en el prompt del sistema (`ContextBuilderService.build_system_prompt`), sin excepción:
+
+- El bot **nunca redacta documentos formales** en nombre de la empresa (cartas laborales, certificados, contratos, cotizaciones con precios, etc.), ni siquiera como "borrador", "ejemplo" o "solo de referencia" — esas son la misma solicitud disfrazada.
+- El bot **nunca inventa ni calcula un precio**.
+- Si el agente tiene una herramienta de escalamiento (`human_handoff`) activa, la usa de inmediato en estos casos. Si no la tiene, le dice a la persona que contacte directamente al área correspondiente.
+
+### `business_type` — reglas configurables por agente
+
+Cada `Agent` tiene un campo `business_type: "products" | "services" | "both"` (default `"products"`) que decide cómo se comporta el bot ante consultas de venta:
+
+| `business_type` | Comportamiento |
+|---|---|
+| `products` | Responde con normalidad preguntas de stock/disponibilidad usando sus Knowledge Bases. Si no tiene la talla/color/variante exacta, **sugiere alternativas** en vez de solo decir que no hay. Escala de inmediato (sin pedir más datos) en cuanto la persona pida un precio o cotización. |
+| `services` | Los servicios tienen costos variables — el bot escala de inmediato ante **cualquier** solicitud de un servicio concreto, sin importar si mencionan precio o no, y sin pedir información adicional (eso lo recopila el humano). |
+| `both` | El bot identifica primero si la solicitud es sobre un producto o un servicio (apoyándose en si el ítem aparece en sus documentos como artículo de catálogo con stock/precio fijo — si no aparece o es ambiguo, lo trata como servicio por seguridad) y aplica la regla correspondiente. |
+
+`escalation_notes` (texto libre, opcional) se agrega siempre **encima** de estas reglas — sirve para casos especiales del negocio que el selector no cubre (ej. *"si preguntan por garantías, escala siempre"*).
+
+Ambos campos se configuran al crear el agente o después, vía `PATCH /agents/{agent_id}`.
+
+### Tool Action `human_handoff`
+
+Es el mecanismo real de escalamiento — un tipo de acción más, igual que Shopify o Calendar:
+
+```json
+POST /agents/{agent_id}/tool-actions
+{
+  "name": "escalar_a_humano",
+  "action_type": "human_handoff",
+  "description": "Escala la conversación a un humano de inmediato cuando el cliente pida una cotización o un servicio específico.",
+  "config": {
+    "webhook_url": "https://hooks.slack.com/services/...",
+    "method": "POST"
+  }
+}
+```
+
+- `config.webhook_url` es **opcional**. Si se configura, el bot hace un POST con `{"resumen": "..."}` cuando escala (best-effort: si el webhook falla, no rompe la conversación). Si no se configura, el caso simplemente queda registrado para revisión en el panel.
+- El parámetro `resumen` (lo que el LLM le pasa a la acción) siempre queda guardado en la tabla `escalations`, sin importar si el webhook existe o respondió bien.
+- Sin ninguna Tool Action `human_handoff` activa, el bot sigue las reglas de arriba pero solo puede **decirle** a la persona que contacte a alguien — no hay a quién avisar ni dónde queda registrado el caso.
+
+### Pausa del bot mientras un humano atiende
+
+Cuando alguien abre un escalamiento desde el panel (`POST /escalations/{id}/take`), la `ChatSession` vinculada se marca `is_paused = true`: a partir de ese momento, si el cliente vuelve a escribirle al bot en esa misma conversación, su mensaje se guarda en el historial pero el bot **no genera ninguna respuesta** (`answer: ""`) — evita que el bot y el humano respondan a la vez. Al marcar el escalamiento como atendido (`PATCH /escalations/{id}` con `is_resolved: true`), la sesión se despausa automáticamente y el bot vuelve a responder con normalidad.
+
+### Panel de atención humana (Escalations)
+
+`GET /escalations` lista todos los casos escalados (de todas las organizaciones/agentes), con resumen, canal, organización y estado. Desde ahí, `POST /escalations/{id}/take` + `GET /escalations/{id}/messages` + `POST /escalations/{id}/messages` permiten ver el historial completo de la conversación y responder como si fuera el agente humano — ver el detalle completo de endpoints en [Escalations (panel de atención humana)](#escalations-panel-de-atención-humana).
+
+> **Nota**: los mensajes enviados desde este panel hoy solo quedan registrados en la conversación — no se reenvían automáticamente al canal real (WhatsApp/Twilio). Es la base para un futuro panel multiagente con login; por ahora es la herramienta para que alguien del equipo revise y responda manualmente cada caso.
+
+### Onboarding inteligente (usuarios externos nuevos)
+
+Cuando un cliente nuevo escribe y el canal tiene `onboarding_questions` configuradas, el sistema ya no pregunta mecánicamente una por una: cada mensaje se analiza con el LLM (`OnboardingService.extract_answers`) para detectar si **ya contiene la respuesta a preguntas que todavía no se han hecho** (ej. el cliente da su nombre y el servicio que necesita en la misma frase). Solo se pregunta lo que de verdad falta, y en cuanto no queda nada pendiente, el mensaje se entrega al flujo normal de chat (LLM + tools + las reglas de arriba) en vez de un mensaje de cierre genérico — así, si lo que pidió debía escalar, escala de inmediato sin que el bot vuelva a preguntar algo que ya le dijeron.
 
 ---
 
@@ -505,8 +581,34 @@ Usuario escribe → agente recibe channel + channel_id (teléfono)
 
 ---
 
+#### `GET /organizations`
+Lista todas las organizaciones.
+
+---
+
+#### `GET /organizations/{organization_id}`
+Obtiene una organización por su id.
+
+---
+
 #### `GET /organizations/{organization_id}/agents`
 Lista todos los agentes de una organización.
+
+---
+
+#### `GET /organizations/{organization_id}/knowledge-bases`
+Lista las knowledge bases de una organización.
+
+**Query params:** `area` (opcional, filtra por área)
+
+---
+
+#### `DELETE /organizations/{organization_id}`
+Elimina la organización y **todo** lo que depende de ella: agentes (y sus tools/tool actions,
+con cascada a nivel de base de datos), sesiones de chat, mensajes, memorias de usuario y
+resúmenes de conversación de esos agentes, y cada knowledge base (con sus documentos, chunks
+y embeddings). Los `User`/`UserChannel` **no** se eliminan — son identidades cross-canal/cross-organización
+(un mismo teléfono puede hablar con agentes de otras organizaciones). **Respuesta `204 No Content`**
 
 ---
 
@@ -547,6 +649,21 @@ Igual que el anterior con streaming SSE.
 ```
 
 > El campo `area` es libre: `"rrhh"`, `"ventas"`, `"tesoreria"`, etc. Se usa para filtrar con `?area=` en el endpoint de la organización.
+
+---
+
+#### `GET /knowledge-bases/{knowledge_base_id}`
+Obtiene una knowledge base por su id.
+
+---
+
+#### `DELETE /knowledge-bases/{knowledge_base_id}`
+Elimina la knowledge base y, en cascada, sus documentos, chunks y embeddings (no hay `ON DELETE CASCADE` a nivel de base de datos para estas tablas, así que el borrado se hace en la capa de aplicación). **Respuesta `204 No Content`**
+
+---
+
+#### `GET /knowledge-bases/{knowledge_base_id}/documents`
+Lista los documentos subidos a una knowledge base, con su estado de procesamiento.
 
 ---
 
@@ -592,17 +709,27 @@ Igual que el anterior con streaming SSE.
   "organization_id": "org-uuid",
   "name": "Bot Comercial Externo",
   "description": "Responde preguntas de clientes sobre productos y precios",
-  "visibility": "external"
+  "visibility": "external",
+  "business_type": "products",
+  "escalation_notes": null
 }
 ```
 
-**Campo `visibility`**
+**Campo `visibility`** (solo informativo — no cambia el comportamiento del bot, es para que tú/quien administre recuerde para qué es el agente; lo que realmente controla el flujo de identidad es el `user_type` de cada Tool)
 
 | Valor | Descripción |
 |-------|-------------|
 | `"internal"` | Solo para empleados |
 | `"external"` | Para clientes externos |
 | `"both"` | Ambos públicos |
+
+**Campo `business_type`** (default `"products"`, sí afecta el comportamiento — ver [Restricciones de negocio y escalamiento a humano](#restricciones-de-negocio-y-escalamiento-a-humano))
+
+| Valor | Descripción |
+|-------|-------------|
+| `"products"` | Responde stock normal, sugiere alternativas, escala solo si piden precio |
+| `"services"` | Escala de inmediato ante cualquier solicitud de un servicio concreto |
+| `"both"` | Distingue producto vs. servicio según las Knowledge Bases del agente |
 
 **Respuesta `201`**
 ```json
@@ -611,6 +738,8 @@ Igual que el anterior con streaming SSE.
   "organization_id": "org-uuid",
   "name": "Bot Comercial Externo",
   "visibility": "external",
+  "business_type": "products",
+  "escalation_notes": null,
   "created_at": "2026-06-09T14:00:00Z",
   "knowledge_bases": []
 }
@@ -620,6 +749,16 @@ Igual que el anterior con streaming SSE.
 
 #### `GET /agents/{agent_id}`
 Obtiene el agente con todas sus KBs vinculadas.
+
+---
+
+#### `PATCH /agents/{agent_id}`
+Actualiza parcialmente un agente — solo los campos enviados se modifican (`name`, `description`, `visibility`, `business_type`, `escalation_notes`).
+
+**Body (ejemplo — solo cambiar el tipo de negocio):**
+```json
+{ "business_type": "services" }
+```
 
 ---
 
@@ -980,6 +1119,73 @@ Ejecuta la acción directamente con los parámetros indicados para verificar cre
 
 ---
 
+### Escalations (panel de atención humana)
+
+#### `GET /escalations`
+Lista todos los escalamientos de todas las organizaciones/agentes.
+
+**Query params:** `is_resolved` (opcional: `true` / `false`. Sin el parámetro, devuelve todos)
+
+**Respuesta `200`**
+```json
+[
+  {
+    "id": "escalation-uuid",
+    "agent_id": "agent-uuid",
+    "agent_name": "Bot Comercial Externo",
+    "organization_name": "Empresa XYZ",
+    "channel": "whatsapp",
+    "channel_id": "+573001234567",
+    "summary": "El cliente solicita una cotización de un logo y un volante.",
+    "is_resolved": false,
+    "created_at": "2026-06-20T18:00:00Z",
+    "resolved_at": null
+  }
+]
+```
+
+---
+
+#### `PATCH /escalations/{escalation_id}`
+Marca el escalamiento como atendido/pendiente. Al pasar `is_resolved: true`, **reanuda el bot** automáticamente en esa conversación (`is_paused = false`).
+
+**Body:**
+```json
+{ "is_resolved": true }
+```
+
+---
+
+#### `GET /escalations/{escalation_id}`
+Detalle de un escalamiento, incluyendo `session_id`, `user_id` y el estado actual de pausa (`is_paused`).
+
+---
+
+#### `GET /escalations/{escalation_id}/messages`
+Historial completo de mensajes de la conversación (hasta 500), en orden cronológico. `role` puede ser `user`, `assistant` o `human`.
+
+---
+
+#### `POST /escalations/{escalation_id}/take`
+Pausa la sesión vinculada (`is_paused = true`) — se llama al abrir el caso para atenderlo, así el bot deja de responder automáticamente mientras un humano lo gestiona.
+
+**Respuesta `200`**
+```json
+{ "session_id": "session-uuid", "is_paused": true }
+```
+
+---
+
+#### `POST /escalations/{escalation_id}/messages`
+Envía un mensaje como agente humano dentro de esa conversación (`role: "human"`). Hoy solo queda registrado en el historial — no se reenvía al canal real (ver [Restricciones de negocio y escalamiento a humano](#restricciones-de-negocio-y-escalamiento-a-humano)).
+
+**Body:**
+```json
+{ "content": "Hola, soy Carlos del equipo de diseño. Ya tengo tu cotización lista." }
+```
+
+---
+
 ### Configuración de la organización (multi-tenant)
 
 #### `PUT /organizations/{organization_id}/config`
@@ -1281,6 +1487,7 @@ Puedes cambiar el umbral por acción con `"advance_notice_hours": 2` en el `conf
 | `google_calendar_cancel_event` | `service_account_json` o `oauth_token` | `calendars[]` + `timezone` + `advance_notice_hours` |
 | `google_calendar_update_event` | `service_account_json` o `oauth_token` | `calendars[]` + `timezone` + `advance_notice_hours` |
 | `custom_rest` | `headers` (opcionales) | `url`, `method`, `headers` (opcionales) |
+| `human_handoff` | `headers` (opcionales, para el webhook) | `webhook_url` (opcional), `method` |
 
 ---
 

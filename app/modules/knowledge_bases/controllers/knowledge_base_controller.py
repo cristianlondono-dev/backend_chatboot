@@ -15,8 +15,14 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database.database import get_db
+from app.modules.documents.repositories.document_repository import (
+    DocumentRepository
+)
 from app.modules.documents.services.document_extractor_service import (
     SUPPORTED_TYPES
+)
+from app.modules.knowledge_bases.repositories.knowledge_base_repository import (
+    KnowledgeBaseRepository
 )
 from app.modules.knowledge_bases.schemas.knowledge_base_schema import (
     AskRequest,
@@ -27,6 +33,9 @@ from app.modules.knowledge_bases.schemas.knowledge_base_schema import (
 )
 from app.modules.knowledge_bases.use_cases.create_knowledge_base_use_case import (
     CreateKnowledgeBaseUseCase
+)
+from app.modules.knowledge_bases.use_cases.delete_knowledge_base_use_case import (
+    DeleteKnowledgeBaseUseCase
 )
 from app.modules.documents.use_cases.process_document_use_case import (
     ProcessDocumentUseCase
@@ -88,6 +97,42 @@ async def create_knowledge_base(
         description=body.description,
         area=body.area
     )
+
+
+@router.get(
+    "/{knowledge_base_id}",
+    response_model=KnowledgeBaseResponse
+)
+async def get_knowledge_base(
+    knowledge_base_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    kb = await KnowledgeBaseRepository(db).get_by_id(knowledge_base_id)
+    if not kb:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge base no encontrada")
+    return kb
+
+
+@router.delete(
+    "/{knowledge_base_id}",
+    status_code=status.HTTP_204_NO_CONTENT
+)
+async def delete_knowledge_base(
+    knowledge_base_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    await DeleteKnowledgeBaseUseCase(db).execute(knowledge_base_id)
+
+
+@router.get(
+    "/{knowledge_base_id}/documents",
+    response_model=list[DocumentUploadResponse]
+)
+async def list_knowledge_base_documents(
+    knowledge_base_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    return await DocumentRepository(db).get_by_knowledge_base_id(knowledge_base_id)
 
 
 @router.post(

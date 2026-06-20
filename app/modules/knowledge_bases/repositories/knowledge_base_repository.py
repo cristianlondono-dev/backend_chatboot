@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.knowledge_bases.models.knowledge_base_model import (
@@ -57,3 +57,8 @@ class KnowledgeBaseRepository:
 
     async def get_by_id(self, knowledge_base_id: UUID) -> KnowledgeBase | None:
         return await self.db.get(KnowledgeBase, knowledge_base_id)
+
+    async def delete(self, knowledge_base_id: UUID) -> None:
+        await self.db.execute(
+            delete(KnowledgeBase).where(KnowledgeBase.id == knowledge_base_id)
+        )

@@ -1,8 +1,9 @@
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.memory.models.chat_session_model import ChatSession
 from app.modules.memory.models.message_model import Message
 
 
@@ -42,3 +43,9 @@ class MessageRepository:
             select(func.count()).where(Message.session_id == session_id)
         )
         return result.scalar_one()
+
+    async def delete_by_agent_ids(self, agent_ids: list[uuid.UUID]) -> None:
+        if not agent_ids:
+            return
+        session_ids_subquery = select(ChatSession.id).where(ChatSession.agent_id.in_(agent_ids))
+        await self.db.execute(delete(Message).where(Message.session_id.in_(session_ids_subquery)))

@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.embeddings.models.chunk_embedding_model import ChunkEmbedding
@@ -83,3 +83,13 @@ class ChunkEmbeddingRepository:
         ]
 
         return [item for item in results if item["similarity"] >= MIN_SIMILARITY]
+
+    async def delete_by_knowledge_base_id(self, knowledge_base_id: UUID) -> None:
+        chunk_ids_subquery = (
+            select(DocumentChunk.id)
+            .join(Document, Document.id == DocumentChunk.document_id)
+            .where(Document.knowledge_base_id == knowledge_base_id)
+        )
+        await self.db.execute(
+            delete(ChunkEmbedding).where(ChunkEmbedding.chunk_id.in_(chunk_ids_subquery))
+        )

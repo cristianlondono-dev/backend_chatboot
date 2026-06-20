@@ -13,11 +13,13 @@ from app.modules.agents.schemas.agent_schema import (
     AskAgentRequest,
     AskAgentResponse,
     CreateAgentRequest,
+    UpdateAgentRequest,
 )
 from app.modules.agents.use_cases.agent_use_cases import (
     AddKnowledgeBaseToAgentUseCase,
     CreateAgentUseCase,
     RemoveKnowledgeBaseFromAgentUseCase,
+    UpdateAgentUseCase,
 )
 from app.modules.retrieval.use_cases.ask_multi_kb_use_case import AskMultiKbUseCase
 
@@ -34,7 +36,9 @@ async def create_agent(
         organization_id=body.organization_id,
         name=body.name,
         description=body.description,
-        visibility=body.visibility
+        visibility=body.visibility,
+        business_type=body.business_type,
+        escalation_notes=body.escalation_notes
     )
 
 
@@ -48,6 +52,16 @@ async def get_agent(
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agente no encontrado")
     return agent
+
+
+@router.patch("/{agent_id}", response_model=AgentResponse)
+async def update_agent(
+    agent_id: UUID,
+    body: UpdateAgentRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    use_case = UpdateAgentUseCase(db)
+    return await use_case.execute(agent_id, **body.model_dump(exclude_unset=True))
 
 
 @router.post("/{agent_id}/knowledge-bases", status_code=status.HTTP_204_NO_CONTENT)
