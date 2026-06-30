@@ -16,3 +16,5 @@ from app.modules.memory.models import user_memory_embedding_model  # noqa
 from app.modules.memory.models import conversation_summary_model  # noqa
 from app.modules.memory.models import conversation_summary_embedding_model  # noqa
 from app.modules.tools.models import agent_tool_model  # noqa
+from app.modules.tools.models import tool_action_model  # noqa
+from app.modules.organizations.models import organization_config_model  # noqa

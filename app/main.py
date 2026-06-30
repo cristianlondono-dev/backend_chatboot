@@ -13,6 +13,7 @@ from app.modules.knowledge_bases.controllers.knowledge_base_controller import ro
 from app.modules.agents.controllers.agent_controller import router as agent_router
 from app.modules.memory.controllers.memory_controller import router as memory_router
 from app.modules.tools.controllers.tool_controller import router as tool_router
+from app.modules.tools.controllers.tool_action_controller import router as tool_action_router
 
 setup_logging()
 
@@ -98,6 +99,7 @@ app.include_router(knowledge_base_router)
 app.include_router(agent_router)
 app.include_router(memory_router)
 app.include_router(tool_router)
+app.include_router(tool_action_router)
 
 
 @app.get("/")

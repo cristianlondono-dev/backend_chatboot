@@ -14,6 +14,14 @@ class OrganizationRepository:
     ):
         self.db = db
 
+    async def get_all(self) -> list[Organization]:
+        result = await self.db.execute(select(Organization).order_by(Organization.created_at.desc()))
+        return list(result.scalars().all())
+
+    async def delete(self, organization: Organization) -> None:
+        await self.db.delete(organization)
+        await self.db.commit()
+
     async def create(
         self,
         trade_name: str,
