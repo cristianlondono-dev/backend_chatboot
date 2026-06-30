@@ -13,6 +13,7 @@ from app.modules.agents.schemas.agent_schema import (
     AskAgentRequest,
     AskAgentResponse,
     CreateAgentRequest,
+    UpdateAgentRequest,
 )
 from app.modules.agents.use_cases.agent_use_cases import (
     AddKnowledgeBaseToAgentUseCase,
@@ -45,6 +46,19 @@ async def get_agent(
 ):
     repo = AgentRepository(db)
     agent = await repo.get_by_id(agent_id)
+    if not agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agente no encontrado")
+    return agent
+
+
+@router.patch("/{agent_id}", response_model=AgentResponse)
+async def update_agent(
+    agent_id: UUID,
+    body: UpdateAgentRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    repo = AgentRepository(db)
+    agent = await repo.update(agent_id, **body.model_dump(exclude_none=True))
     if not agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agente no encontrado")
     return agent

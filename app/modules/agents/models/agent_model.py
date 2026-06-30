@@ -40,6 +40,19 @@ class Agent(Base):
         default="internal"
     )
 
+    # "products" | "services" | "both"
+    business_type: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="products",
+        server_default="products"
+    )
+
+    escalation_notes: Mapped[str | None] = mapped_column(
+        String(2000),
+        nullable=True
+    )
+
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

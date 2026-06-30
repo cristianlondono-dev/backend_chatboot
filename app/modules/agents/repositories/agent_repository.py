@@ -60,6 +60,16 @@ class AgentRepository:
         await self.db.commit()
         return link
 
+    async def update(self, agent_id: UUID, **fields) -> Agent | None:
+        agent = await self.get_by_id(agent_id)
+        if agent is None:
+            return None
+        for key, value in fields.items():
+            if value is not None:
+                setattr(agent, key, value)
+        await self.db.commit()
+        return await self._load(agent_id)
+
     async def remove_knowledge_base(
         self,
         agent_id: UUID,
